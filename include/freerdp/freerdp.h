@@ -100,9 +100,13 @@ extern "C"
 	 *  @return 1 to accept and store a certificate, 2 to accept
 	 *          a certificate only for this session, 0 otherwise.
 	 */
-	typedef DWORD (*pVerifyCertificate)(freerdp* instance, const char* common_name,
-	                                    const char* subject, const char* issuer,
-	                                    const char* fingerprint, BOOL host_mismatch);
+#if defined(WITH_FREERDP_DEPRECATED)
+	typedef WINPR_DEPRECATED_VAR(
+	    "Use pVerifyCertificateEx",
+	    DWORD (*pVerifyCertificate)(freerdp* instance, const char* common_name, const char* subject,
+	                                const char* issuer, const char* fingerprint,
+	                                BOOL host_mismatch));
+#endif
 
 	/** @brief Callback used if user interaction is required to accept
 	 *         an unknown certificate.
@@ -130,7 +134,7 @@ extern "C"
 	 *  @param common_name      The certificate registered hostname.
 	 *  @param subject          The common name of the new certificate.
 	 *  @param issuer           The issuer of the new certificate.
-	 *  @param fingerprint      The fingerprint of the new certificate.
+	 *  @param new_fingerprint  The fingerprint of the new certificate.
 	 *  @param old_subject      The common name of the old certificate.
 	 *  @param old_issuer       The issuer of the new certificate.
 	 *  @param old_fingerprint  The fingerprint of the old certificate.
@@ -138,11 +142,14 @@ extern "C"
 	 *  @return 1 to accept and store a certificate, 2 to accept
 	 *          a certificate only for this session, 0 otherwise.
 	 */
-
-	typedef DWORD (*pVerifyChangedCertificate)(freerdp* instance, const char* common_name,
-	                                           const char* subject, const char* issuer,
-	                                           const char* new_fingerprint, const char* old_subject,
-	                                           const char* old_issuer, const char* old_fingerprint);
+#if defined(WITH_FREERDP_DEPRECATED)
+	typedef WINPR_DEPRECATED_VAR(
+	    "Use pVerifyChangedCertificateEx",
+	    DWORD (*pVerifyChangedCertificate)(freerdp* instance, const char* common_name,
+	                                       const char* subject, const char* issuer,
+	                                       const char* new_fingerprint, const char* old_subject,
+	                                       const char* old_issuer, const char* old_fingerprint));
+#endif
 
 	/** @brief Callback used if user interaction is required to accept
 	 *         a changed certificate.
@@ -152,7 +159,7 @@ extern "C"
 	 *  @param common_name      The certificate registered hostname.
 	 *  @param subject          The common name of the new certificate.
 	 *  @param issuer           The issuer of the new certificate.
-	 *  @param fingerprint      The fingerprint of the new certificate (old) or the certificate in
+	 *  @param new_fingerprint  The fingerprint of the new certificate (old) or the certificate in
 	 * PEM format (VERIFY_CERT_FLAG_FP_IS_PEM set)
 	 *  @param old_subject      The common name of the old certificate.
 	 *  @param old_issuer       The issuer of the new certificate.
@@ -367,15 +374,17 @@ extern "C"
 		                                                         Callback for authentication.
 		                                                         It is used to get the username/password when it was not
 		                                                         provided at connection time. */
+#if defined(WITH_FREERDP_DEPRECATED)
 		ALIGN64 pVerifyCertificate VerifyCertificate;               /**< (offset 51)
-		                                                         Callback for certificate validation.
-		                                                         Used to verify that an unknown certificate is
-		           trusted. DEPRECATED: Use VerifyChangedCertificateEx*/
-		ALIGN64 pVerifyChangedCertificate VerifyChangedCertificate; /**< (offset 52)
-		                                                         Callback for changed certificate
-		                      validation. Used when a certificate differs from stored fingerprint.
-		                      DEPRECATED: Use VerifyChangedCertificateEx */
-
+    Callback for certificate validation.
+    Used to verify that an unknown certificate is
+trusted. DEPRECATED: Use VerifyChangedCertificateEx*/
+		ALIGN64 pVerifyChangedCertificate VerifyChangedCertificate; /**<
+(offset 52) Callback for changed certificate validation. Used when a certificate differs from stored
+fingerprint. DEPRECATED: Use VerifyChangedCertificateEx */
+#else
+	    ALIGN64 UINT64 reserved[2];
+#endif
 		ALIGN64 pVerifyX509Certificate
 		    VerifyX509Certificate; /**< (offset 53)  Callback for X509 certificate verification (PEM
 		                              format) */

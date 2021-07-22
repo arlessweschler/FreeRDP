@@ -558,6 +558,7 @@ rdpSettings* freerdp_settings_new(DWORD flags)
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, FALSE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, FALSE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_GfxPlanar, TRUE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxH264, FALSE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxSendQoeAck, FALSE))
@@ -606,7 +607,8 @@ rdpSettings* freerdp_settings_new(DWORD flags)
 	    !freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveRetries, 3) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveDelay, 5) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveInterval, 2) ||
-	    !freerdp_settings_set_uint32(settings, FreeRDP_TcpAckTimeout, 9000))
+	    !freerdp_settings_set_uint32(settings, FreeRDP_TcpAckTimeout, 9000) ||
+	    !freerdp_settings_set_uint32(settings, FreeRDP_TcpConnectTimeout, 15000))
 		goto out_fail;
 
 	if (!freerdp_settings_get_bool(settings, FreeRDP_ServerMode))
@@ -999,7 +1001,7 @@ static BOOL freerdp_settings_int_buffer_copy(rdpSettings* _settings, const rdpSe
 	     index++)
 	{
 		_settings->StaticChannelArray[index] =
-		    freerdp_static_channel_clone(settings->StaticChannelArray[index]);
+		    freerdp_addin_argv_clone(settings->StaticChannelArray[index]);
 
 		if (!_settings->StaticChannelArray[index])
 			goto out_fail;
@@ -1037,7 +1039,7 @@ static BOOL freerdp_settings_int_buffer_copy(rdpSettings* _settings, const rdpSe
 	     index++)
 	{
 		_settings->DynamicChannelArray[index] =
-		    freerdp_dynamic_channel_clone(settings->DynamicChannelArray[index]);
+		    freerdp_addin_argv_clone(settings->DynamicChannelArray[index]);
 
 		if (!_settings->DynamicChannelArray[index])
 			goto out_fail;

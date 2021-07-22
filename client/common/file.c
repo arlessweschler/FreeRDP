@@ -26,6 +26,7 @@
 #include <stdlib.h>
 
 #include <winpr/string.h>
+#include <winpr/file.h>
 
 #include <freerdp/client/file.h>
 #include <freerdp/client/cmdline.h>
@@ -96,22 +97,22 @@ struct rdp_file
 	DWORD EnableSuperSpan;             /* enablesuperpan */
 	DWORD SuperSpanAccelerationFactor; /* superpanaccelerationfactor */
 
-	DWORD DesktopWidth;  /* desktopwidth */
-	DWORD DesktopHeight; /* desktopheight */
-	DWORD DesktopSizeId; /* desktop size id */
-	DWORD SessionBpp;    /* session bpp */
+	DWORD DesktopWidth;       /* desktopwidth */
+	DWORD DesktopHeight;      /* desktopheight */
+	DWORD DesktopSizeId;      /* desktop size id */
+	DWORD SessionBpp;         /* session bpp */
 	DWORD DesktopScaleFactor; /* desktopscalefactor */
 
 	DWORD Compression;       /* compression */
 	DWORD KeyboardHook;      /* keyboardhook */
 	DWORD DisableCtrlAltDel; /* disable ctrl+alt+del */
 
-	DWORD AudioMode;         /* audiomode */
-	DWORD AudioQualityMode;  /* audioqualitymode */
-	DWORD AudioCaptureMode;  /* audiocapturemode */
+	DWORD AudioMode;                             /* audiomode */
+	DWORD AudioQualityMode;                      /* audioqualitymode */
+	DWORD AudioCaptureMode;                      /* audiocapturemode */
 	DWORD EncodeRedirectedVideoCapture;          /* encode redirected video capture */
 	DWORD RedirectedVideoCaptureEncodingQuality; /* redirected video capture encoding quality */
-	DWORD VideoPlaybackMode; /* videoplaybackmode */
+	DWORD VideoPlaybackMode;                     /* videoplaybackmode */
 
 	DWORD ConnectionType; /* connection type */
 
@@ -808,7 +809,7 @@ BOOL freerdp_client_parse_rdp_file_ex(rdpFile* file, const char* name, rdp_file_
 	if (_strnicmp(fname, "file://", 7) == 0)
 		fname = &name[7];
 
-	fp = fopen(fname, "r");
+	fp = winpr_fopen(fname, "r");
 
 	if (!fp)
 	{
@@ -868,7 +869,7 @@ static INLINE BOOL FILE_POPULATE_STRING(char** _target, const rdpSettings* _sett
 
 	str = freerdp_settings_get_string(_settings, _option);
 	freerdp_client_file_string_check_free(*_target);
-	*_target = NULL;
+	*_target = (void*)~((size_t)NULL);
 	if (str)
 	{
 		*_target = _strdup(str);
@@ -895,6 +896,7 @@ BOOL freerdp_client_populate_rdp_file_from_settings(rdpFile* file, const rdpSett
 	size_t index;
 	UINT32 LoadBalanceInfoLength;
 	const char* GatewayHostname = NULL;
+	char* redirectCameras = NULL;
 
 	if (!FILE_POPULATE_STRING(&file->Domain, settings, FreeRDP_Domain) ||
 	    !FILE_POPULATE_STRING(&file->Username, settings, FreeRDP_Username) ||
@@ -1020,7 +1022,9 @@ BOOL freerdp_client_populate_rdp_file_from_settings(rdpFile* file, const rdpSett
 	file->AutoReconnectionEnabled =
 	    freerdp_settings_get_bool(settings, FreeRDP_AutoReconnectionEnabled);
 	file->RedirectSmartCards = freerdp_settings_get_bool(settings, FreeRDP_RedirectSmartCards);
-	file->RedirectCameras = freerdp_client_channel_args_to_string(settings, "rdpecam", "device:");
+
+	redirectCameras = freerdp_client_channel_args_to_string(settings, "rdpecam", "device:");
+	if (redirectCameras)
 	{
 		char* str = freerdp_client_channel_args_to_string(settings, "rdpecam", "encode:");
 		file->EncodeRedirectedVideoCapture = 0;
@@ -1033,10 +1037,8 @@ BOOL freerdp_client_populate_rdp_file_from_settings(rdpFile* file, const rdpSett
 				file->EncodeRedirectedVideoCapture = val;
 		}
 		free(str);
-	}
-	{
-		char* str = freerdp_client_channel_args_to_string(settings, "rdpecam", "quality:");
 
+		str = freerdp_client_channel_args_to_string(settings, "rdpecam", "quality:");
 		file->RedirectedVideoCaptureEncodingQuality = 0;
 		if (str)
 		{
@@ -1049,6 +1051,8 @@ BOOL freerdp_client_populate_rdp_file_from_settings(rdpFile* file, const rdpSett
 			}
 		}
 		free(str);
+
+		file->RedirectCameras = redirectCameras;
 	}
 #ifdef CHANNEL_URBDRC_CLIENT
 	file->UsbDevicesToRedirect =
@@ -1111,7 +1115,7 @@ BOOL freerdp_client_write_rdp_file(const rdpFile* file, const char* name, BOOL u
 		return FALSE;
 	}
 
-	fp = fopen(name, "w+b");
+	fp = winpr_fopen(name, "w+b");
 
 	if (fp)
 	{
@@ -1160,8 +1164,10 @@ BOOL freerdp_client_write_rdp_file(const rdpFile* file, const char* name, BOOL u
 	return (status == 0) ? TRUE : FALSE;
 }
 
+#if __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
 static SSIZE_T freerdp_client_write_setting_to_buffer(char** buffer, size_t* bufferSize,
                                                       const char* fmt, ...)
 {
@@ -1204,7 +1210,9 @@ static SSIZE_T freerdp_client_write_setting_to_buffer(char** buffer, size_t* buf
 
 	return len;
 }
+#if __GNUC__
 #pragma GCC diagnostic pop
+#endif
 
 size_t freerdp_client_write_rdp_file_buffer(const rdpFile* file, char* buffer, size_t size)
 {
@@ -1222,13 +1230,19 @@ size_t freerdp_client_write_rdp_file_buffer(const rdpFile* file, char* buffer, s
 		totalSize += (size_t)res;                                                           \
 	}
 
-#define WRITE_SETTING_INT(fmt_, param_) \
-	if (~(param_))                      \
-	WRITE_SETTING_(fmt_, param_)
+#define WRITE_SETTING_INT(fmt_, param_)  \
+	do                                   \
+	{                                    \
+		if (~(param_))                   \
+			WRITE_SETTING_(fmt_, param_) \
+	} while (0)
 
-#define WRITE_SETTING_STR(fmt_, param_) \
-	if (~(size_t)(param_))              \
-	WRITE_SETTING_(fmt_, param_)
+#define WRITE_SETTING_STR(fmt_, param_)  \
+	do                                   \
+	{                                    \
+		if (~(size_t)(param_))           \
+			WRITE_SETTING_(fmt_, param_) \
+	} while (0)
 
 	/* integer parameters */
 	WRITE_SETTING_INT("use multimon:i:%" PRIu32, file->UseMultiMon);

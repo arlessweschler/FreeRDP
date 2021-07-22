@@ -21,9 +21,11 @@
 #include "config.h"
 #endif
 
+#include <winpr/environment.h>
 #include <winpr/wtypes.h>
 #include <winpr/timezone.h>
 #include <winpr/crt.h>
+#include <winpr/file.h>
 #include "../log.h"
 
 #define TAG WINPR_TAG("timezone")
@@ -237,9 +239,9 @@ static char* winpr_get_unix_timezone_identifier_from_file(void)
 	FILE* fp;
 	char* tzid = NULL;
 #if defined(__FreeBSD__) || defined(__OpenBSD__)
-	fp = fopen("/var/db/zoneinfo", "r");
+	fp = winpr_fopen("/var/db/zoneinfo", "r");
 #else
-	fp = fopen("/etc/timezone", "r");
+	fp = winpr_fopen("/etc/timezone", "r");
 #endif
 
 	if (NULL == fp)
@@ -282,9 +284,22 @@ static BOOL winpr_match_unix_timezone_identifier_with_list(const char* tzid, con
 static TIME_ZONE_ENTRY* winpr_detect_windows_time_zone(void)
 {
 	size_t i, j;
-	char* tzid;
+	char* tzid = NULL;
+	LPCSTR tz = "TZ";
 
-	tzid = winpr_get_unix_timezone_identifier_from_file();
+	DWORD nSize = GetEnvironmentVariableA(tz, NULL, 0);
+	if (nSize)
+	{
+		tzid = (char*)malloc(nSize);
+		if (!GetEnvironmentVariableA(tz, tzid, nSize))
+		{
+			free(tzid);
+			tzid = NULL;
+		}
+	}
+
+	if (tzid == NULL)
+		tzid = winpr_get_unix_timezone_identifier_from_file();
 
 	if (tzid == NULL)
 		tzid = winpr_get_timezone_from_link();

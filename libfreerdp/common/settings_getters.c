@@ -234,6 +234,9 @@ BOOL freerdp_settings_get_bool(const rdpSettings* settings, size_t id)
 		case FreeRDP_GfxH264:
 			return settings->GfxH264;
 
+		case FreeRDP_GfxPlanar:
+			return settings->GfxPlanar;
+
 		case FreeRDP_GfxProgressive:
 			return settings->GfxProgressive;
 
@@ -491,6 +494,9 @@ BOOL freerdp_settings_get_bool(const rdpSettings* settings, size_t id)
 
 		case FreeRDP_SurfaceFrameMarkerEnabled:
 			return settings->SurfaceFrameMarkerEnabled;
+
+		case FreeRDP_SuspendInput:
+			return settings->SuspendInput;
 
 		case FreeRDP_TcpKeepAlive:
 			return settings->TcpKeepAlive;
@@ -815,6 +821,10 @@ BOOL freerdp_settings_set_bool(rdpSettings* settings, size_t id, BOOL val)
 
 		case FreeRDP_GfxH264:
 			settings->GfxH264 = val;
+			break;
+
+		case FreeRDP_GfxPlanar:
+			settings->GfxPlanar = val;
 			break;
 
 		case FreeRDP_GfxProgressive:
@@ -1159,6 +1169,10 @@ BOOL freerdp_settings_set_bool(rdpSettings* settings, size_t id, BOOL val)
 
 		case FreeRDP_SurfaceFrameMarkerEnabled:
 			settings->SurfaceFrameMarkerEnabled = val;
+			break;
+
+		case FreeRDP_SuspendInput:
+			settings->SuspendInput = val;
 			break;
 
 		case FreeRDP_TcpKeepAlive:
@@ -1608,6 +1622,9 @@ UINT32 freerdp_settings_get_uint32(const rdpSettings* settings, size_t id)
 
 		case FreeRDP_TcpAckTimeout:
 			return settings->TcpAckTimeout;
+
+		case FreeRDP_TcpConnectTimeout:
+			return settings->TcpConnectTimeout;
 
 		case FreeRDP_TcpKeepAliveDelay:
 			return settings->TcpKeepAliveDelay;
@@ -2065,6 +2082,10 @@ BOOL freerdp_settings_set_uint32(rdpSettings* settings, size_t id, UINT32 val)
 
 		case FreeRDP_TcpAckTimeout:
 			settings->TcpAckTimeout = val;
+			break;
+
+		case FreeRDP_TcpConnectTimeout:
+			settings->TcpConnectTimeout = val;
 			break;
 
 		case FreeRDP_TcpKeepAliveDelay:

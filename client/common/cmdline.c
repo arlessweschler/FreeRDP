@@ -24,7 +24,7 @@
 #endif
 
 #include <ctype.h>
-#include <assert.h>
+#include <winpr/assert.h>
 #include <errno.h>
 
 #include <winpr/crt.h>
@@ -93,7 +93,7 @@ static BOOL freerdp_path_valid(const char* path, BOOL* special)
 	                ? TRUE
 	                : FALSE;
 	if (!isSpecial)
-		isPath = PathFileExistsA(path);
+		isPath = winpr_PathFileExists(path);
 
 	if (special)
 		*special = isSpecial;
@@ -151,9 +151,9 @@ static BOOL freerdp_client_add_drive(rdpSettings* settings, const char* path, co
 	if (name)
 	{
 		/* Path was entered as secondary argument, swap */
-		if (PathFileExistsA(name))
+		if (winpr_PathFileExists(name))
 		{
-			if (!PathFileExistsA(path) || (!PathIsRelativeA(name) && PathIsRelativeA(path)))
+			if (!winpr_PathFileExists(path) || (!PathIsRelativeA(name) && PathIsRelativeA(path)))
 			{
 				const char* tmp = path;
 				path = name;
@@ -2654,7 +2654,7 @@ int freerdp_client_settings_parse_command_line_arguments(rdpSettings* settings, 
 		}
 		CommandLineSwitchCase(arg, "nsc")
 		{
-			settings->NSCodec = enable;
+			freerdp_settings_set_bool(settings, FreeRDP_NSCodec, enable);
 		}
 #if defined(WITH_JPEG)
 		CommandLineSwitchCase(arg, "jpeg")
@@ -3025,7 +3025,7 @@ int freerdp_client_settings_parse_command_line_arguments(rdpSettings* settings, 
 			}
 			else if (strcmp(arg->Value, "nsc") == 0)
 			{
-				settings->NSCodec = TRUE;
+				freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE);
 			}
 
 #if defined(WITH_JPEG)
@@ -3396,7 +3396,8 @@ int freerdp_client_settings_parse_command_line_arguments(rdpSettings* settings, 
 
 	freerdp_performance_flags_make(settings);
 
-	if (settings->RemoteFxCodec || settings->NSCodec || settings->SupportGraphicsPipeline)
+	if (settings->RemoteFxCodec || freerdp_settings_get_bool(settings, FreeRDP_NSCodec) ||
+	    settings->SupportGraphicsPipeline)
 	{
 		settings->FastPathOutput = TRUE;
 		settings->FrameMarkerCommandEnabled = TRUE;

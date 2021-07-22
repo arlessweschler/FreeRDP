@@ -241,7 +241,8 @@ static UINT rdpei_send_pdu(RDPEI_CHANNEL_CALLBACK* callback, wStream* s, UINT16 
                            UINT32 pduLength)
 {
 	UINT status;
-	if (!callback || !s || !callback->channel || !callback->channel->Write)
+
+	if (!callback || !s || !callback->channel || !callback->channel->Write || !callback->plugin)
 		return ERROR_INTERNAL_ERROR;
 
 	Stream_SetPosition(s, 0);
@@ -366,8 +367,15 @@ static UINT rdpei_send_pen_frame(RdpeiClientContext* context, RDPINPUT_PEN_FRAME
 	rdpei = (RDPEI_PLUGIN*)context->handle;
 	if (!rdpei || !rdpei->listener_callback)
 		return ERROR_INTERNAL_ERROR;
+	if (!rdpei || !rdpei->rdpcontext)
+		return ERROR_INTERNAL_ERROR;
+	if (freerdp_settings_get_bool(rdpei->rdpcontext->settings, FreeRDP_SuspendInput))
+		return CHANNEL_RC_OK;
 
 	callback = rdpei->listener_callback->channel_callback;
+	/* Just ignore the event if the channel is not connected */
+	if (!callback)
+		return CHANNEL_RC_OK;
 
 	if (!rdpei->previousPenFrameTime && !rdpei->currentPenFrameTime)
 	{
@@ -660,8 +668,15 @@ static UINT rdpei_send_touch_event_pdu(RDPEI_CHANNEL_CALLBACK* callback,
 	UINT status;
 	wStream* s;
 	UINT32 pduLength;
+	RDPEI_PLUGIN* rdpei = (RDPEI_PLUGIN*)callback->plugin->pInterface;
+	if (!rdpei || !rdpei->rdpcontext)
+		return ERROR_INTERNAL_ERROR;
+	if (freerdp_settings_get_bool(rdpei->rdpcontext->settings, FreeRDP_SuspendInput))
+		return CHANNEL_RC_OK;
+
 	if (!frame)
 		return ERROR_INTERNAL_ERROR;
+
 	pduLength = 64 + (frame->contactCount * 64);
 	s = Stream_New(NULL, pduLength);
 
@@ -872,6 +887,15 @@ static UINT rdpei_on_data_received(IWTSVirtualChannelCallback* pChannelCallback,
 static UINT rdpei_on_close(IWTSVirtualChannelCallback* pChannelCallback)
 {
 	RDPEI_CHANNEL_CALLBACK* callback = (RDPEI_CHANNEL_CALLBACK*)pChannelCallback;
+	if (callback)
+	{
+		RDPEI_PLUGIN* rdpei = (RDPEI_PLUGIN*)callback->plugin;
+		if (rdpei && rdpei->listener_callback)
+		{
+			if (rdpei->listener_callback->channel_callback == callback)
+				rdpei->listener_callback->channel_callback = NULL;
+		}
+	}
 	free(callback);
 	return CHANNEL_RC_OK;
 }
@@ -922,11 +946,9 @@ static UINT rdpei_plugin_terminated(IWTSPlugin* pPlugin)
 	if (!pPlugin)
 		return ERROR_INVALID_PARAMETER;
 
-	if (rdpei && rdpei->listener_callback)
+	if (rdpei)
 	{
-		IWTSVirtualChannelManager* mgr = rdpei->listener_callback->channel_mgr;
-		if (mgr)
-			IFCALL(mgr->DestroyListener, mgr, rdpei->listener);
+		IWTSVirtualChannelManager* mgr = NULL;
 
 		rdpei->initialized = FALSE;
 		if (rdpei->event)
@@ -939,6 +961,12 @@ static UINT rdpei_plugin_terminated(IWTSPlugin* pPlugin)
 		}
 		if (rdpei->event)
 			CloseHandle(rdpei->event);
+
+		if (rdpei->listener_callback)
+			mgr = rdpei->listener_callback->channel_mgr;
+
+		if (mgr)
+			IFCALL(mgr->DestroyListener, mgr, rdpei->listener);
 	}
 	DeleteCriticalSection(&rdpei->lock);
 	free(rdpei->listener_callback);
@@ -1026,11 +1054,16 @@ static UINT32 rdpei_get_features(RdpeiClientContext* context)
  */
 UINT rdpei_send_frame(RdpeiClientContext* context, RDPINPUT_TOUCH_FRAME* frame)
 {
-	UINT64 currentTime;
+	UINT64 currentTime = GetTickCount64();
 	RDPEI_PLUGIN* rdpei = (RDPEI_PLUGIN*)context->handle;
-	RDPEI_CHANNEL_CALLBACK* callback = rdpei->listener_callback->channel_callback;
+	RDPEI_CHANNEL_CALLBACK* callback;
 	UINT error;
-	currentTime = GetTickCount64();
+
+	callback = rdpei->listener_callback->channel_callback;
+
+	/* Just ignore the event if the channel is not connected */
+	if (!callback)
+		return CHANNEL_RC_OK;
 
 	if (!rdpei->previousFrameTime && !rdpei->currentFrameTime)
 	{
@@ -1125,7 +1158,7 @@ static UINT rdpei_touch_process(RdpeiClientContext* context, INT32 externalId, U
 				          contactIdlocal, p);
 				p = 359;
 			}
-			contact.orientation = va_arg(ap, UINT32);
+			contact.orientation = p;
 		}
 		if (fieldFlags & CONTACT_DATA_PRESSURE_PRESENT)
 		{
@@ -1156,11 +1189,13 @@ static UINT rdpei_touch_process(RdpeiClientContext* context, INT32 externalId, U
 static UINT rdpei_touch_begin(RdpeiClientContext* context, INT32 externalId, INT32 x, INT32 y,
                               INT32* contactId)
 {
-	va_list ap;
-	return rdpei_touch_process(context, externalId,
-	                           RDPINPUT_CONTACT_FLAG_DOWN | RDPINPUT_CONTACT_FLAG_INRANGE |
-	                               RDPINPUT_CONTACT_FLAG_INCONTACT,
-	                           x, y, contactId, 0, ap);
+	UINT rc;
+	va_list ap = { 0 };
+	rc = rdpei_touch_process(context, externalId,
+	                         RDPINPUT_CONTACT_FLAG_DOWN | RDPINPUT_CONTACT_FLAG_INRANGE |
+	                             RDPINPUT_CONTACT_FLAG_INCONTACT,
+	                         x, y, contactId, 0, ap);
+	return rc;
 }
 
 /**
@@ -1171,11 +1206,13 @@ static UINT rdpei_touch_begin(RdpeiClientContext* context, INT32 externalId, INT
 static UINT rdpei_touch_update(RdpeiClientContext* context, INT32 externalId, INT32 x, INT32 y,
                                INT32* contactId)
 {
-	va_list ap;
-	return rdpei_touch_process(context, externalId,
-	                           RDPINPUT_CONTACT_FLAG_UPDATE | RDPINPUT_CONTACT_FLAG_INRANGE |
-	                               RDPINPUT_CONTACT_FLAG_INCONTACT,
-	                           x, y, contactId, 0, ap);
+	UINT rc;
+	va_list ap = { 0 };
+	rc = rdpei_touch_process(context, externalId,
+	                         RDPINPUT_CONTACT_FLAG_UPDATE | RDPINPUT_CONTACT_FLAG_INRANGE |
+	                             RDPINPUT_CONTACT_FLAG_INCONTACT,
+	                         x, y, contactId, 0, ap);
+	return rc;
 }
 
 /**
@@ -1186,15 +1223,17 @@ static UINT rdpei_touch_update(RdpeiClientContext* context, INT32 externalId, IN
 static UINT rdpei_touch_end(RdpeiClientContext* context, INT32 externalId, INT32 x, INT32 y,
                             INT32* contactId)
 {
-	va_list ap;
-	UINT error = rdpei_touch_process(context, externalId,
-	                                 RDPINPUT_CONTACT_FLAG_UPDATE | RDPINPUT_CONTACT_FLAG_INRANGE |
-	                                     RDPINPUT_CONTACT_FLAG_INCONTACT,
-	                                 x, y, contactId, 0, ap);
+	UINT error;
+	va_list ap = { 0 };
+	error = rdpei_touch_process(context, externalId,
+	                            RDPINPUT_CONTACT_FLAG_UPDATE | RDPINPUT_CONTACT_FLAG_INRANGE |
+	                                RDPINPUT_CONTACT_FLAG_INCONTACT,
+	                            x, y, contactId, 0, ap);
 	if (error != CHANNEL_RC_OK)
 		return error;
-	return rdpei_touch_process(context, externalId, RDPINPUT_CONTACT_FLAG_UP, x, y, contactId, 0,
-	                           ap);
+	error =
+	    rdpei_touch_process(context, externalId, RDPINPUT_CONTACT_FLAG_UP, x, y, contactId, 0, ap);
+	return error;
 }
 
 /**
@@ -1205,10 +1244,12 @@ static UINT rdpei_touch_end(RdpeiClientContext* context, INT32 externalId, INT32
 static UINT rdpei_touch_cancel(RdpeiClientContext* context, INT32 externalId, INT32 x, INT32 y,
                                INT32* contactId)
 {
-	va_list ap;
-	return rdpei_touch_process(context, externalId,
-	                           RDPINPUT_CONTACT_FLAG_UP | RDPINPUT_CONTACT_FLAG_CANCELED, x, y,
-	                           contactId, 0, ap);
+	UINT rc;
+	va_list ap = { 0 };
+	rc = rdpei_touch_process(context, externalId,
+	                         RDPINPUT_CONTACT_FLAG_UP | RDPINPUT_CONTACT_FLAG_CANCELED, x, y,
+	                         contactId, 0, ap);
+	return rc;
 }
 
 static UINT rdpei_touch_raw_event(RdpeiClientContext* context, INT32 externalId, INT32 x, INT32 y,
@@ -1377,10 +1418,14 @@ static UINT rdpei_pen_end(RdpeiClientContext* context, INT32 externalId, UINT32 
 	                          RDPINPUT_CONTACT_FLAG_UPDATE | RDPINPUT_CONTACT_FLAG_INRANGE |
 	                              RDPINPUT_CONTACT_FLAG_INCONTACT,
 	                          fieldFlags, x, y, ap);
+	va_end(ap);
 	if (error == CHANNEL_RC_OK)
+	{
+		va_start(ap, y);
 		error =
 		    rdpei_pen_process(context, externalId, RDPINPUT_CONTACT_FLAG_UP, fieldFlags, x, y, ap);
 	va_end(ap);
+	}
 	return error;
 }
 
