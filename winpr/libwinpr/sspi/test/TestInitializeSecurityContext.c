@@ -11,18 +11,18 @@ static const char* test_Password = "Password";
 int TestInitializeSecurityContext(int argc, char* argv[])
 {
 	int rc = -1;
-	UINT32 cbMaxLen;
-	UINT32 fContextReq;
-	void* output_buffer = NULL;
+	UINT32 cbMaxLen = 0;
+	UINT32 fContextReq = 0;
+	void* output_buffer = nullptr;
 	CtxtHandle context;
-	ULONG pfContextAttr;
-	SECURITY_STATUS status;
-	CredHandle credentials = { 0 };
+	ULONG pfContextAttr = 0;
+	SECURITY_STATUS status = 0;
+	CredHandle credentials = WINPR_C_ARRAY_INIT;
 	TimeStamp expiration;
-	PSecPkgInfo pPackageInfo;
-	SEC_WINNT_AUTH_IDENTITY identity = { 0 };
-	SecurityFunctionTable* table;
-	PSecBuffer p_SecBuffer;
+	PSecPkgInfo pPackageInfo = nullptr;
+	SEC_WINNT_AUTH_IDENTITY identity = WINPR_C_ARRAY_INIT;
+	SecurityFunctionTable* table = nullptr;
+	PSecBuffer p_SecBuffer = nullptr;
 	SecBuffer output_SecBuffer;
 	SecBufferDesc output_SecBuffer_desc;
 
@@ -51,8 +51,9 @@ int TestInitializeSecurityContext(int argc, char* argv[])
 	identity.DomainLength = strlen(test_Domain);
 	identity.PasswordLength = strlen(test_Password);
 	identity.Flags = SEC_WINNT_AUTH_IDENTITY_ANSI;
-	status = table->AcquireCredentialsHandle(NULL, NTLM_SSP_NAME, SECPKG_CRED_OUTBOUND, NULL,
-	                                         &identity, NULL, NULL, &credentials, &expiration);
+	status =
+	    table->AcquireCredentialsHandle(nullptr, NTLM_SSP_NAME, SECPKG_CRED_OUTBOUND, nullptr,
+	                                    &identity, nullptr, nullptr, &credentials, &expiration);
 
 	if (status != SEC_E_OK)
 	{
@@ -76,9 +77,9 @@ int TestInitializeSecurityContext(int argc, char* argv[])
 	output_SecBuffer.cbBuffer = cbMaxLen;
 	output_SecBuffer.BufferType = SECBUFFER_TOKEN;
 	output_SecBuffer.pvBuffer = output_buffer;
-	status = table->InitializeSecurityContext(&credentials, NULL, NULL, fContextReq, 0, 0, NULL, 0,
-	                                          &context, &output_SecBuffer_desc, &pfContextAttr,
-	                                          &expiration);
+	status = table->InitializeSecurityContext(&credentials, nullptr, nullptr, fContextReq, 0, 0,
+	                                          nullptr, 0, &context, &output_SecBuffer_desc,
+	                                          &pfContextAttr, &expiration);
 
 	if (status != SEC_I_CONTINUE_NEEDED)
 	{

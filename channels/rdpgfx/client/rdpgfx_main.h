@@ -53,9 +53,11 @@ typedef struct
 
 	rdpContext* rdpcontext;
 
-	wLog* log;
 	RDPGFX_CAPSET ConnectionCaps;
 	RdpgfxClientContext* context;
+	BOOL allowedCodecs[RDPGFX_CODECID_MAX + 1];
 } RDPGFX_PLUGIN;
+
+FREERDP_LOCAL UINT logSurfaceCommand(RDPGFX_PLUGIN* gfx, const RDPGFX_SURFACE_COMMAND* cmd);
 
 #endif /* FREERDP_CHANNEL_RDPGFX_CLIENT_MAIN_H */

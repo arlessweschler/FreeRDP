@@ -11,6 +11,7 @@
 #include <winpr/assert.h>
 
 #include "ios_freerdp_events.h"
+#include "ios_cliprdr.h"
 
 #pragma mark -
 #pragma mark Sending compacted input events (from main thread)
@@ -19,7 +20,17 @@
 // not threadsafe: caller is responsible for synchronization
 BOOL ios_events_send(mfInfo *mfi, NSDictionary *event_description)
 {
-	NSData *encoded_description = [NSKeyedArchiver archivedDataWithRootObject:event_description];
+	NSError *error = nil;
+	NSData *encoded_description = [NSKeyedArchiver archivedDataWithRootObject:event_description
+	                                                    requiringSecureCoding:YES
+	                                                                    error:&error];
+
+	if (!encoded_description)
+	{
+		NSLog(@"%s: Failed to archive event (type: %@): %@", __func__,
+		      [event_description objectForKey:@"type"], error);
+		return FALSE;
+	}
 
 	WINPR_ASSERT(mfi);
 
@@ -66,9 +77,14 @@ static BOOL ios_events_handle_event(mfInfo *mfi, NSDictionary *event_description
 
 	if ([event_type isEqualToString:@"mouse"])
 	{
-		input->MouseEvent(input, [[event_description objectForKey:@"flags"] unsignedShortValue],
-		                  [[event_description objectForKey:@"coord_x"] unsignedShortValue],
-		                  [[event_description objectForKey:@"coord_y"] unsignedShortValue]);
+		if (!input->MouseEvent(input,
+		                       [[event_description objectForKey:@"flags"] unsignedShortValue],
+		                       [[event_description objectForKey:@"coord_x"] unsignedShortValue],
+		                       [[event_description objectForKey:@"coord_y"] unsignedShortValue]))
+		{
+			// Returning an error here can terminate the connection.
+			NSLog(@"%s: MouseEvent failed.", __func__);
+		}
 	}
 	else if ([event_type isEqualToString:@"keyboard"])
 	{
@@ -83,6 +99,16 @@ static BOOL ios_events_handle_event(mfInfo *mfi, NSDictionary *event_description
 		else
 			NSLog(@"%s: doesn't know how to send keyboard input with subtype %@", __func__,
 			      [event_description objectForKey:@"subtype"]);
+	}
+	else if ([event_type isEqualToString:@"clipboard"])
+	{
+		mfContext *afc = mfi->context;
+		afc->clipboardHasText = [[event_description objectForKey:@"has_text"] boolValue];
+
+		// before the channel is ready the monitor ready handler sends the list instead
+		if (afc->cliprdr && afc->clipboardSync &&
+		    (ios_cliprdr_send_client_format_list(afc->cliprdr) != CHANNEL_RC_OK))
+			NSLog(@"%s: failed to send the clipboard format list.", __func__);
 	}
 	else if ([event_type isEqualToString:@"disconnect"])
 		should_continue = FALSE;
@@ -130,8 +156,20 @@ BOOL ios_events_check_handle(mfInfo *mfi)
 		return FALSE;
 	}
 
-	id unarchived_object_data = [NSKeyedUnarchiver unarchiveObjectWithData:archived_object_data];
+	NSError *error = nil;
+	NSDictionary *unarchived_object_data = [NSKeyedUnarchiver
+	    unarchivedObjectOfClasses:[NSSet setWithObjects:[NSDictionary class], [NSString class],
+	                                                    [NSNumber class], nil]
+	                     fromData:archived_object_data
+	                        error:&error];
 	[archived_object_data release];
+
+	if (!unarchived_object_data)
+	{
+		// just return TRUE and ignore data. (if return FALSE, sesison can be terminated)
+		NSLog(@"%s: Failed to unarchive input event: %@", __func__, error);
+		return TRUE;
+	}
 
 	return ios_events_handle_event(mfi, unarchived_object_data);
 }
@@ -157,7 +195,7 @@ BOOL ios_events_create_pipe(mfInfo *mfi)
 
 	mfi->event_pipe_consumer = pipe_fds[0];
 	mfi->event_pipe_producer = pipe_fds[1];
-	mfi->handle = CreateFileDescriptorEvent(NULL, FALSE, FALSE, mfi->event_pipe_consumer,
+	mfi->handle = CreateFileDescriptorEvent(nullptr, FALSE, FALSE, mfi->event_pipe_consumer,
 	                                        WINPR_FD_READ | WINPR_FD_WRITE);
 	return TRUE;
 }
@@ -170,5 +208,5 @@ void ios_events_free_pipe(mfInfo *mfi)
 	mfi->event_pipe_consumer = mfi->event_pipe_producer = -1;
 	close(producer_fd);
 	close(consumer_fd);
-	CloseHandle(mfi->handle);
+	(void)CloseHandle(mfi->handle);
 }

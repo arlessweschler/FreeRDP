@@ -34,15 +34,18 @@
 #include <winpr/thread.h>
 #include <winpr/stream.h>
 #include <winpr/interlocked.h>
+#include <winpr/file.h>
 #include <winpr/path.h>
+#include <winpr/print.h>
 
 #include <freerdp/channels/rdpdr.h>
 #include <freerdp/crypto/crypto.h>
+#include <freerdp/freerdp.h>
 
 #include "../printer.h"
 
 #include <freerdp/client/printer.h>
-
+#include <freerdp/utils/rdpdr_utils.h>
 #include <freerdp/channels/log.h>
 
 #define TAG CHANNELS_TAG("printer.client")
@@ -53,7 +56,7 @@ typedef struct
 
 	rdpPrinter* printer;
 
-	WINPR_PSLIST_HEADER pIrpList;
+	wQueue* pIrpList;
 
 	HANDLE event;
 	HANDLE stopEvent;
@@ -61,6 +64,7 @@ typedef struct
 	HANDLE thread;
 	rdpContext* rdpcontext;
 	char port[64];
+	BOOL async;
 } PRINTER_DEVICE;
 
 typedef enum
@@ -74,35 +78,64 @@ typedef enum
 static const char* filemap[] = { "PortDosName", "PnPName", "DriverName",
 	                             "CachedPrinterConfigData" };
 
-static char* get_printer_config_path(const rdpSettings* settings, const WCHAR* name, size_t length)
+WINPR_ATTR_MALLOC(free, 1)
+static char* get_printer_hash(const WCHAR* name, size_t length)
 {
+	BYTE hash[WINPR_SHA256_DIGEST_LENGTH] = WINPR_C_ARRAY_INIT;
+
+	if (!winpr_Digest(WINPR_MD_SHA256, name, length, hash, sizeof(hash)))
+		return nullptr;
+
+	return winpr_BinToHexString(hash, sizeof(hash), FALSE);
+}
+
+WINPR_ATTR_MALLOC(free, 1)
+static char* get_printer_config_path(const rdpSettings* settings, const WCHAR* name, size_t length,
+                                     BOOL create)
+{
+	char* config = nullptr;
 	const char* path = freerdp_settings_get_string(settings, FreeRDP_ConfigPath);
 	char* dir = GetCombinedPath(path, "printers");
-	char* bname = crypto_base64_encode((const BYTE*)name, length);
-	char* config = GetCombinedPath(dir, bname);
+	if (!dir)
+		return nullptr;
+	char* bname = get_printer_hash(name, length);
+	if (!bname)
+		goto fail;
+	config = GetCombinedPath(dir, bname);
 
 	if (config && !winpr_PathFileExists(config))
 	{
-		if (!winpr_PathMakePath(config, NULL))
+		if (!create || !winpr_PathMakePath(config, nullptr))
 		{
+			char* uname = ConvertWCharNToUtf8Alloc(name, length, nullptr);
+			if (!create)
+				WLog_WARN(TAG, "Printer configuration for unknown printer %s requested, ignoring",
+				          uname);
+			else
+				WLog_WARN(TAG, "Could not create printer configuration for %s", uname);
+			free(uname);
 			free(config);
-			config = NULL;
+			config = nullptr;
 		}
 	}
 
+fail:
 	free(dir);
 	free(bname);
 	return config;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL printer_write_setting(const char* path, prn_conf_t type, const void* data,
                                   size_t length)
 {
+	if (!path)
+		return FALSE;
+
 	DWORD written = 0;
 	BOOL rc = FALSE;
-	HANDLE file;
-	size_t b64len;
-	char* base64 = NULL;
+	HANDLE file = nullptr;
+	char* base64 = nullptr;
 	const char* name = filemap[type];
 	char* abs = GetCombinedPath(path, name);
 
@@ -112,7 +145,8 @@ static BOOL printer_write_setting(const char* path, prn_conf_t type, const void*
 		return FALSE;
 	}
 
-	file = CreateFileA(abs, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	file = winpr_CreateFile(abs, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+	                        nullptr);
 	free(abs);
 
 	if (file == INVALID_HANDLE_VALUE)
@@ -120,15 +154,13 @@ static BOOL printer_write_setting(const char* path, prn_conf_t type, const void*
 
 	if (length > 0)
 	{
-		base64 = crypto_base64_encode(data, length);
+		size_t b64len = 0;
+		base64 = crypto_base64_encode_len(data, length, &b64len);
 
 		if (!base64)
 			goto fail;
 
-		/* base64 char represents 6bit -> 4*(n/3) is the length which is
-		 * always smaller than 2*n */
-		b64len = strnlen(base64, 2 * length);
-		rc = WriteFile(file, base64, b64len, &written, NULL);
+		rc = WriteFile(file, base64, (UINT32)b64len, &written, nullptr);
 
 		if (b64len != written)
 			rc = FALSE;
@@ -137,11 +169,12 @@ static BOOL printer_write_setting(const char* path, prn_conf_t type, const void*
 		rc = TRUE;
 
 fail:
-	CloseHandle(file);
+	(void)CloseHandle(file);
 	free(base64);
 	return rc;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL printer_config_valid(const char* path)
 {
 	if (!path)
@@ -153,20 +186,31 @@ static BOOL printer_config_valid(const char* path)
 	return TRUE;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL printer_read_setting(const char* path, prn_conf_t type, void** data, UINT32* length)
 {
-	DWORD lowSize, highSize;
+	DWORD lowSize = 0;
+	DWORD highSize = 0;
 	DWORD read = 0;
 	BOOL rc = FALSE;
-	HANDLE file;
-	char* fdata = NULL;
+	char* fdata = nullptr;
 	const char* name = filemap[type];
-	char* abs = GetCombinedPath(path, name);
 
+	switch (type)
+	{
+		case PRN_CONF_DATA:
+			break;
+		default:
+			WLog_DBG(TAG, "Printer option %s ignored", name);
+			return FALSE;
+	}
+
+	char* abs = GetCombinedPath(path, name);
 	if (!abs)
 		return FALSE;
 
-	file = CreateFileA(abs, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	HANDLE file = winpr_CreateFile(abs, GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+	                               FILE_ATTRIBUTE_NORMAL, nullptr);
 	free(abs);
 
 	if (file == INVALID_HANDLE_VALUE)
@@ -184,14 +228,14 @@ static BOOL printer_read_setting(const char* path, prn_conf_t type, void** data,
 		if (!fdata)
 			goto fail;
 
-		rc = ReadFile(file, fdata, lowSize, &read, NULL);
+		rc = ReadFile(file, fdata, lowSize, &read, nullptr);
 
 		if (lowSize != read)
 			rc = FALSE;
 	}
 
 fail:
-	CloseHandle(file);
+	(void)CloseHandle(file);
 
 	if (rc && (lowSize <= INT_MAX))
 	{
@@ -209,13 +253,14 @@ fail:
 	else
 	{
 		*length = 0;
-		*data = NULL;
+		*data = nullptr;
 	}
 
 	free(fdata);
 	return rc;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL printer_save_to_config(const rdpSettings* settings, const char* PortDosName,
                                    size_t PortDosNameLen, const WCHAR* PnPName, size_t PnPNameLen,
                                    const WCHAR* DriverName, size_t DriverNameLen,
@@ -223,7 +268,7 @@ static BOOL printer_save_to_config(const rdpSettings* settings, const char* Port
                                    const BYTE* CachedPrinterConfigData, size_t CacheFieldsLen)
 {
 	BOOL rc = FALSE;
-	char* path = get_printer_config_path(settings, PrinterName, PrintNameLen);
+	char* path = get_printer_config_path(settings, PrinterName, PrintNameLen, FALSE);
 
 	if (!path)
 		goto fail;
@@ -240,17 +285,24 @@ static BOOL printer_save_to_config(const rdpSettings* settings, const char* Port
 	if (!printer_write_setting(path, PRN_CONF_DATA, CachedPrinterConfigData, CacheFieldsLen))
 		goto fail;
 
+	rc = TRUE;
 fail:
 	free(path);
 	return rc;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL printer_update_to_config(const rdpSettings* settings, const WCHAR* name, size_t length,
                                      const BYTE* data, size_t datalen)
 {
 	BOOL rc = FALSE;
-	char* path = get_printer_config_path(settings, name, length);
+	char* path = get_printer_config_path(settings, name, length, FALSE);
+
+	if (!path)
+		goto fail;
+
 	rc = printer_write_setting(path, PRN_CONF_DATA, data, datalen);
+fail:
 	free(path);
 	return rc;
 }
@@ -258,10 +310,17 @@ static BOOL printer_update_to_config(const rdpSettings* settings, const WCHAR* n
 static BOOL printer_remove_config(const rdpSettings* settings, const WCHAR* name, size_t length)
 {
 	BOOL rc = FALSE;
-	char* path = get_printer_config_path(settings, name, length);
+	char* path = get_printer_config_path(settings, name, length, FALSE);
 
 	if (!printer_config_valid(path))
 		goto fail;
+
+	for (size_t x = 0; x < ARRAYSIZE(filemap); x++)
+	{
+		char* abs = GetCombinedPath(path, filemap[x]);
+		(void)winpr_DeleteFile(abs);
+		free(abs);
+	}
 
 	rc = winpr_RemoveDirectory(path);
 fail:
@@ -269,14 +328,15 @@ fail:
 	return rc;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL printer_move_config(const rdpSettings* settings, const WCHAR* oldName, size_t oldLength,
                                 const WCHAR* newName, size_t newLength)
 {
 	BOOL rc = FALSE;
-	char* oldPath = get_printer_config_path(settings, oldName, oldLength);
-	char* newPath = get_printer_config_path(settings, newName, newLength);
+	char* oldPath = get_printer_config_path(settings, oldName, oldLength, FALSE);
+	char* newPath = get_printer_config_path(settings, newName, newLength, FALSE);
 
-	if (printer_config_valid(oldPath))
+	if (printer_config_valid(oldPath) && newPath)
 		rc = winpr_MoveFile(oldPath, newPath);
 
 	free(oldPath);
@@ -284,34 +344,39 @@ static BOOL printer_move_config(const rdpSettings* settings, const WCHAR* oldNam
 	return rc;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL printer_load_from_config(const rdpSettings* settings, rdpPrinter* printer,
                                      PRINTER_DEVICE* printer_dev)
 {
 	BOOL res = FALSE;
-	WCHAR* wname = NULL;
-	size_t wlen;
-	char* path = NULL;
-	int rc;
+	WCHAR* wname = nullptr;
+	size_t wlen = 0;
+	char* path = nullptr;
 	UINT32 flags = 0;
-	void* DriverName = NULL;
+	void* DriverName = nullptr;
 	UINT32 DriverNameLen = 0;
-	void* PnPName = NULL;
+	void* PnPName = nullptr;
 	UINT32 PnPNameLen = 0;
-	void* CachedPrinterConfigData = NULL;
+	void* CachedPrinterConfigData = nullptr;
 	UINT32 CachedFieldsLen = 0;
 	UINT32 PrinterNameLen = 0;
 
-	if (!settings || !printer)
+	if (!settings || !printer || !printer->name)
 		return FALSE;
 
-	rc = ConvertToUnicode(CP_UTF8, 0, printer->name, -1, &wname, 0);
+	wname = ConvertUtf8ToWCharAlloc(printer->name, &wlen);
 
-	if (rc <= 0)
+	if (!wname)
 		goto fail;
 
-	wlen = _wcslen(wname) + 1;
-	path = get_printer_config_path(settings, wname, wlen * sizeof(WCHAR));
-	PrinterNameLen = (wlen + 1) * sizeof(WCHAR);
+	wlen++;
+	path = get_printer_config_path(settings, wname, wlen * sizeof(WCHAR), TRUE);
+	{
+		const size_t plen = wlen * sizeof(WCHAR);
+		if (plen > UINT32_MAX)
+			goto fail;
+		PrinterNameLen = (UINT32)plen;
+	}
 
 	if (!path)
 		goto fail;
@@ -325,15 +390,21 @@ static BOOL printer_load_from_config(const rdpSettings* settings, rdpPrinter* pr
 
 	if (!printer_read_setting(path, PRN_CONF_DRIVER, &DriverName, &DriverNameLen))
 	{
-		DriverNameLen =
-		    ConvertToUnicode(CP_UTF8, 0, printer->driver, -1, (LPWSTR*)&DriverName, 0) * 2 + 1;
+		size_t len = 0;
+		DriverName = ConvertUtf8ToWCharAlloc(printer->driver, &len);
+		if (!DriverName)
+			goto fail;
+		const size_t dlen = (len + 1) * sizeof(WCHAR);
+		if (dlen > UINT32_MAX)
+			goto fail;
+		DriverNameLen = (UINT32)dlen;
 	}
 
 	if (!printer_read_setting(path, PRN_CONF_DATA, &CachedPrinterConfigData, &CachedFieldsLen))
 	{
 	}
 
-	Stream_SetPosition(printer_dev->device.data, 0);
+	Stream_ResetPosition(printer_dev->device.data);
 
 	if (!Stream_EnsureRemainingCapacity(printer_dev->device.data, 24))
 		goto fail;
@@ -359,6 +430,8 @@ static BOOL printer_load_from_config(const rdpSettings* settings, rdpPrinter* pr
 	if (!Stream_EnsureRemainingCapacity(printer_dev->device.data, PrinterNameLen))
 		goto fail;
 
+	for (WCHAR* wptr = wname; (wptr = winpr_wcsnchr(wptr, wlen, winpr_wchar_ToLE('\\')));)
+		*wptr = L'_';
 	Stream_Write(printer_dev->device.data, wname, PrinterNameLen);
 
 	if (!Stream_EnsureRemainingCapacity(printer_dev->device.data, CachedFieldsLen))
@@ -375,31 +448,32 @@ fail:
 	return res;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL printer_save_default_config(const rdpSettings* settings, rdpPrinter* printer)
 {
 	BOOL res = FALSE;
-	WCHAR* wname = NULL;
-	WCHAR* driver = NULL;
-	size_t wlen, dlen;
-	char* path = NULL;
-	int rc;
+	WCHAR* wname = nullptr;
+	WCHAR* driver = nullptr;
+	size_t wlen = 0;
+	size_t dlen = 0;
+	char* path = nullptr;
 
-	if (!settings || !printer)
+	if (!settings || !printer || !printer->name || !printer->driver)
 		return FALSE;
 
-	rc = ConvertToUnicode(CP_UTF8, 0, printer->name, -1, &wname, 0);
+	wname = ConvertUtf8ToWCharAlloc(printer->name, nullptr);
 
-	if (rc <= 0)
+	if (!wname)
 		goto fail;
 
-	rc = ConvertToUnicode(CP_UTF8, 0, printer->driver, -1, &driver, 0);
+	driver = ConvertUtf8ToWCharAlloc(printer->driver, nullptr);
 
-	if (rc <= 0)
+	if (!driver)
 		goto fail;
 
 	wlen = _wcslen(wname) + 1;
 	dlen = _wcslen(driver) + 1;
-	path = get_printer_config_path(settings, wname, wlen * sizeof(WCHAR));
+	path = get_printer_config_path(settings, wname, wlen * sizeof(WCHAR), TRUE);
 
 	if (!path)
 		goto fail;
@@ -423,9 +497,10 @@ fail:
  *
  * @return 0 on success, otherwise a Win32 error code
  */
+WINPR_ATTR_NODISCARD
 static UINT printer_process_irp_create(PRINTER_DEVICE* printer_dev, IRP* irp)
 {
-	rdpPrintJob* printjob = NULL;
+	rdpPrintJob* printjob = nullptr;
 
 	WINPR_ASSERT(printer_dev);
 	WINPR_ASSERT(irp);
@@ -447,7 +522,7 @@ static UINT printer_process_irp_create(PRINTER_DEVICE* printer_dev, IRP* irp)
 		irp->IoStatus = STATUS_PRINT_QUEUE_FULL;
 	}
 
-	return irp->Complete(irp);
+	return CHANNEL_RC_OK;
 }
 
 /**
@@ -455,9 +530,10 @@ static UINT printer_process_irp_create(PRINTER_DEVICE* printer_dev, IRP* irp)
  *
  * @return 0 on success, otherwise a Win32 error code
  */
+WINPR_ATTR_NODISCARD
 static UINT printer_process_irp_close(PRINTER_DEVICE* printer_dev, IRP* irp)
 {
-	rdpPrintJob* printjob = NULL;
+	rdpPrintJob* printjob = nullptr;
 
 	WINPR_ASSERT(printer_dev);
 	WINPR_ASSERT(irp);
@@ -478,7 +554,7 @@ static UINT printer_process_irp_close(PRINTER_DEVICE* printer_dev, IRP* irp)
 	}
 
 	Stream_Zero(irp->output, 4); /* Padding(4) */
-	return irp->Complete(irp);
+	return CHANNEL_RC_OK;
 }
 
 /**
@@ -486,13 +562,13 @@ static UINT printer_process_irp_close(PRINTER_DEVICE* printer_dev, IRP* irp)
  *
  * @return 0 on success, otherwise a Win32 error code
  */
+WINPR_ATTR_NODISCARD
 static UINT printer_process_irp_write(PRINTER_DEVICE* printer_dev, IRP* irp)
 {
-	UINT32 Length;
-	UINT64 Offset;
-	rdpPrintJob* printjob = NULL;
+	UINT32 Length = 0;
+	UINT64 Offset = 0;
+	rdpPrintJob* printjob = nullptr;
 	UINT error = CHANNEL_RC_OK;
-	void* ptr;
 
 	WINPR_ASSERT(printer_dev);
 	WINPR_ASSERT(irp);
@@ -501,8 +577,10 @@ static UINT printer_process_irp_write(PRINTER_DEVICE* printer_dev, IRP* irp)
 		return ERROR_INVALID_DATA;
 	Stream_Read_UINT32(irp->input, Length);
 	Stream_Read_UINT64(irp->input, Offset);
+	(void)Offset; /* [MS-RDPEPC] 2.2.2.9 Server Printer Write Request (DR_PRN_WRITE_REQ)
+	               * reserved for future use, ignore */
 	Stream_Seek(irp->input, 20); /* Padding */
-	ptr = Stream_Pointer(irp->input);
+	const void* ptr = Stream_ConstPointer(irp->input);
 	if (!Stream_SafeSeek(irp->input, Length))
 		return ERROR_INVALID_DATA;
 	if (printer_dev->printer)
@@ -529,9 +607,7 @@ static UINT printer_process_irp_write(PRINTER_DEVICE* printer_dev, IRP* irp)
 
 	Stream_Write_UINT32(irp->output, Length);
 	Stream_Write_UINT8(irp->output, 0); /* Padding */
-
-	WINPR_ASSERT(irp->Complete);
-	return irp->Complete(irp);
+	return CHANNEL_RC_OK;
 }
 
 /**
@@ -539,15 +615,31 @@ static UINT printer_process_irp_write(PRINTER_DEVICE* printer_dev, IRP* irp)
  *
  * @return 0 on success, otherwise a Win32 error code
  */
-static UINT printer_process_irp_device_control(PRINTER_DEVICE* printer_dev, IRP* irp)
+WINPR_ATTR_NODISCARD
+static UINT printer_process_irp_device_control(WINPR_ATTR_UNUSED PRINTER_DEVICE* printer_dev,
+                                               IRP* irp)
 {
 	WINPR_ASSERT(printer_dev);
 	WINPR_ASSERT(irp);
 
 	Stream_Write_UINT32(irp->output, 0); /* OutputBufferLength */
+	return CHANNEL_RC_OK;
+}
 
-	WINPR_ASSERT(irp->Complete);
-	return irp->Complete(irp);
+WINPR_ATTR_NODISCARD
+static UINT printer_evaluate(UINT error, IRP* irp)
+{
+	WINPR_ASSERT(irp);
+	if (error == CHANNEL_RC_OK)
+	{
+		WINPR_ASSERT(irp->Complete);
+		return irp->Complete(irp);
+	}
+
+	WLog_ERR(TAG, "IRP %s failed with %" PRIu32, rdpdr_irp_string(irp->MajorFunction), error);
+	WINPR_ASSERT(irp->Discard);
+	irp->Discard(irp);
+	return error;
 }
 
 /**
@@ -555,9 +647,10 @@ static UINT printer_process_irp_device_control(PRINTER_DEVICE* printer_dev, IRP*
  *
  * @return 0 on success, otherwise a Win32 error code
  */
+WINPR_ATTR_NODISCARD
 static UINT printer_process_irp(PRINTER_DEVICE* printer_dev, IRP* irp)
 {
-	UINT error;
+	UINT error = CHANNEL_RC_OK;
 
 	WINPR_ASSERT(printer_dev);
 	WINPR_ASSERT(irp);
@@ -565,54 +658,32 @@ static UINT printer_process_irp(PRINTER_DEVICE* printer_dev, IRP* irp)
 	switch (irp->MajorFunction)
 	{
 		case IRP_MJ_CREATE:
-			if ((error = printer_process_irp_create(printer_dev, irp)))
-			{
-				WLog_ERR(TAG, "printer_process_irp_create failed with error %" PRIu32 "!", error);
-				return error;
-			}
-
+			error = printer_process_irp_create(printer_dev, irp);
 			break;
 
 		case IRP_MJ_CLOSE:
-			if ((error = printer_process_irp_close(printer_dev, irp)))
-			{
-				WLog_ERR(TAG, "printer_process_irp_close failed with error %" PRIu32 "!", error);
-				return error;
-			}
-
+			error = printer_process_irp_close(printer_dev, irp);
 			break;
 
 		case IRP_MJ_WRITE:
-			if ((error = printer_process_irp_write(printer_dev, irp)))
-			{
-				WLog_ERR(TAG, "printer_process_irp_write failed with error %" PRIu32 "!", error);
-				return error;
-			}
-
+			error = printer_process_irp_write(printer_dev, irp);
 			break;
 
 		case IRP_MJ_DEVICE_CONTROL:
-			if ((error = printer_process_irp_device_control(printer_dev, irp)))
-			{
-				WLog_ERR(TAG, "printer_process_irp_device_control failed with error %" PRIu32 "!",
-				         error);
-				return error;
-			}
-
+			error = printer_process_irp_device_control(printer_dev, irp);
 			break;
 
 		default:
 			irp->IoStatus = STATUS_NOT_SUPPORTED;
-			WINPR_ASSERT(irp->Complete);
-			return irp->Complete(irp);
+			break;
 	}
 
-	return CHANNEL_RC_OK;
+	return printer_evaluate(error, irp);
 }
 
+WINPR_ATTR_NODISCARD
 static DWORD WINAPI printer_thread_func(LPVOID arg)
 {
-	IRP* irp;
 	PRINTER_DEVICE* printer_dev = (PRINTER_DEVICE*)arg;
 	UINT error = CHANNEL_RC_OK;
 
@@ -635,10 +706,10 @@ static DWORD WINAPI printer_thread_func(LPVOID arg)
 		else if (rc != WAIT_OBJECT_0)
 			continue;
 
-		ResetEvent(printer_dev->event);
-		irp = (IRP*)InterlockedPopEntrySList(printer_dev->pIrpList);
+		(void)ResetEvent(printer_dev->event);
+		IRP* irp = (IRP*)Queue_Dequeue(printer_dev->pIrpList);
 
-		if (irp == NULL)
+		if (irp == nullptr)
 		{
 			WLog_ERR(TAG, "InterlockedPopEntrySList failed!");
 			error = ERROR_INTERNAL_ERROR;
@@ -664,6 +735,7 @@ static DWORD WINAPI printer_thread_func(LPVOID arg)
  *
  * @return 0 on success, otherwise a Win32 error code
  */
+WINPR_ATTR_NODISCARD
 static UINT printer_irp_request(DEVICE* device, IRP* irp)
 {
 	PRINTER_DEVICE* printer_dev = (PRINTER_DEVICE*)device;
@@ -671,14 +743,30 @@ static UINT printer_irp_request(DEVICE* device, IRP* irp)
 	WINPR_ASSERT(printer_dev);
 	WINPR_ASSERT(irp);
 
-	InterlockedPushEntrySList(printer_dev->pIrpList, &(irp->ItemEntry));
-	SetEvent(printer_dev->event);
+	if (printer_dev->async)
+	{
+		if (!Queue_Enqueue(printer_dev->pIrpList, irp))
+			return ERROR_INTERNAL_ERROR;
+
+		(void)SetEvent(printer_dev->event);
+	}
+	else
+	{
+		UINT error = printer_process_irp(printer_dev, irp);
+		if (error)
+		{
+			WLog_ERR(TAG, "printer_process_irp failed with error %" PRIu32 "!", error);
+			return error;
+		}
+	}
+
 	return CHANNEL_RC_OK;
 }
 
+WINPR_ATTR_NODISCARD
 static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 packetId, wStream* s)
 {
-	UINT32 eventID;
+	UINT32 eventID = 0;
 	PRINTER_DEVICE* printer_dev = (PRINTER_DEVICE*)device;
 
 	WINPR_ASSERT(printer_dev);
@@ -703,9 +791,14 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
 				case RDPDR_ADD_PRINTER_EVENT:
 				{
 					char PortDosName[8];
-					UINT32 PnPNameLen, DriverNameLen, PrintNameLen, CacheFieldsLen;
-					const WCHAR *PnPName, *DriverName, *PrinterName;
-					const BYTE* CachedPrinterConfigData;
+					UINT32 PnPNameLen = 0;
+					UINT32 DriverNameLen = 0;
+					UINT32 PrintNameLen = 0;
+					UINT32 CacheFieldsLen = 0;
+					const WCHAR* PnPName = nullptr;
+					const WCHAR* DriverName = nullptr;
+					const WCHAR* PrinterName = nullptr;
+					const BYTE* CachedPrinterConfigData = nullptr;
 
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, 24))
 						return ERROR_INVALID_DATA;
@@ -719,25 +812,25 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, PnPNameLen))
 						return ERROR_INVALID_DATA;
 
-					PnPName = (const WCHAR*)Stream_Pointer(s);
+					PnPName = Stream_ConstPointer(s);
 					Stream_Seek(s, PnPNameLen);
 
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, DriverNameLen))
 						return ERROR_INVALID_DATA;
 
-					DriverName = (const WCHAR*)Stream_Pointer(s);
+					DriverName = Stream_ConstPointer(s);
 					Stream_Seek(s, DriverNameLen);
 
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, PrintNameLen))
 						return ERROR_INVALID_DATA;
 
-					PrinterName = (const WCHAR*)Stream_Pointer(s);
+					PrinterName = Stream_ConstPointer(s);
 					Stream_Seek(s, PrintNameLen);
 
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, CacheFieldsLen))
 						return ERROR_INVALID_DATA;
 
-					CachedPrinterConfigData = Stream_Pointer(s);
+					CachedPrinterConfigData = Stream_ConstPointer(s);
 					Stream_Seek(s, CacheFieldsLen);
 
 					if (!printer_save_to_config(settings, PortDosName, sizeof(PortDosName), PnPName,
@@ -750,9 +843,10 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
 
 				case RDPDR_UPDATE_PRINTER_EVENT:
 				{
-					UINT32 PrinterNameLen, ConfigDataLen;
-					const WCHAR* PrinterName;
-					const BYTE* ConfigData;
+					UINT32 PrinterNameLen = 0;
+					UINT32 ConfigDataLen = 0;
+					const WCHAR* PrinterName = nullptr;
+					const BYTE* ConfigData = nullptr;
 
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, 8))
 						return ERROR_INVALID_DATA;
@@ -763,13 +857,13 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, PrinterNameLen))
 						return ERROR_INVALID_DATA;
 
-					PrinterName = (const WCHAR*)Stream_Pointer(s);
+					PrinterName = Stream_ConstPointer(s);
 					Stream_Seek(s, PrinterNameLen);
 
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, ConfigDataLen))
 						return ERROR_INVALID_DATA;
 
-					ConfigData = Stream_Pointer(s);
+					ConfigData = Stream_ConstPointer(s);
 					Stream_Seek(s, ConfigDataLen);
 
 					if (!printer_update_to_config(settings, PrinterName, PrinterNameLen, ConfigData,
@@ -780,8 +874,8 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
 
 				case RDPDR_DELETE_PRINTER_EVENT:
 				{
-					UINT32 PrinterNameLen;
-					const WCHAR* PrinterName;
+					UINT32 PrinterNameLen = 0;
+					const WCHAR* PrinterName = nullptr;
 
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, 4))
 						return ERROR_INVALID_DATA;
@@ -791,7 +885,7 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, PrinterNameLen))
 						return ERROR_INVALID_DATA;
 
-					PrinterName = (const WCHAR*)Stream_Pointer(s);
+					PrinterName = Stream_ConstPointer(s);
 					Stream_Seek(s, PrinterNameLen);
 					printer_remove_config(settings, PrinterName, PrinterNameLen);
 				}
@@ -799,9 +893,10 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
 
 				case RDPDR_RENAME_PRINTER_EVENT:
 				{
-					UINT32 OldPrinterNameLen, NewPrinterNameLen;
-					const WCHAR* OldPrinterName;
-					const WCHAR* NewPrinterName;
+					UINT32 OldPrinterNameLen = 0;
+					UINT32 NewPrinterNameLen = 0;
+					const WCHAR* OldPrinterName = nullptr;
+					const WCHAR* NewPrinterName = nullptr;
 
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, 8))
 						return ERROR_INVALID_DATA;
@@ -812,13 +907,13 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, OldPrinterNameLen))
 						return ERROR_INVALID_DATA;
 
-					OldPrinterName = (const WCHAR*)Stream_Pointer(s);
+					OldPrinterName = Stream_ConstPointer(s);
 					Stream_Seek(s, OldPrinterNameLen);
 
 					if (!Stream_CheckAndLogRequiredLength(TAG, s, NewPrinterNameLen))
 						return ERROR_INVALID_DATA;
 
-					NewPrinterName = (const WCHAR*)Stream_Pointer(s);
+					NewPrinterName = Stream_ConstPointer(s);
 					Stream_Seek(s, NewPrinterNameLen);
 
 					if (!printer_move_config(settings, OldPrinterName, OldPrinterNameLen,
@@ -836,7 +931,7 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
 
 		case PAKID_PRN_USING_XPS:
 		{
-			UINT32 flags;
+			UINT32 flags = 0;
 
 			if (!Stream_CheckAndLogRequiredLength(TAG, s, 4))
 				return ERROR_INVALID_DATA;
@@ -864,37 +959,41 @@ static UINT printer_custom_component(DEVICE* device, UINT16 component, UINT16 pa
  */
 static UINT printer_free(DEVICE* device)
 {
-	IRP* irp;
 	PRINTER_DEVICE* printer_dev = (PRINTER_DEVICE*)device;
-	UINT error;
+	UINT error = 0;
 
 	WINPR_ASSERT(printer_dev);
 
-	SetEvent(printer_dev->stopEvent);
-
-	if (WaitForSingleObject(printer_dev->thread, INFINITE) == WAIT_FAILED)
+	if (printer_dev->async)
 	{
-		error = GetLastError();
-		WLog_ERR(TAG, "WaitForSingleObject failed with error %" PRIu32 "", error);
+		(void)SetEvent(printer_dev->stopEvent);
 
-		/* The analyzer is confused by this premature return value.
-		 * Since this case can not be handled gracefully silence the
-		 * analyzer here. */
+		if (WaitForSingleObject(printer_dev->thread, INFINITE) == WAIT_FAILED)
+		{
+			error = GetLastError();
+			WLog_ERR(TAG, "WaitForSingleObject failed with error %" PRIu32 "", error);
+
+			/* The analyzer is confused by this premature return value.
+			 * Since this case can not be handled gracefully silence the
+			 * analyzer here. */
 #ifndef __clang_analyzer__
-		return error;
+			return error;
 #endif
-	}
+		}
 
-	while ((irp = (IRP*)InterlockedPopEntrySList(printer_dev->pIrpList)) != NULL)
-	{
-		WINPR_ASSERT(irp->Discard);
-		irp->Discard(irp);
-	}
+		while (Queue_Count(printer_dev->pIrpList) > 0)
+		{
+			IRP* irp = Queue_Dequeue(printer_dev->pIrpList);
+			WINPR_ASSERT(irp);
+			WINPR_ASSERT(irp->Discard);
+			irp->Discard(irp);
+		}
 
-	CloseHandle(printer_dev->thread);
-	CloseHandle(printer_dev->stopEvent);
-	CloseHandle(printer_dev->event);
-	winpr_aligned_free(printer_dev->pIrpList);
+		(void)CloseHandle(printer_dev->thread);
+		(void)CloseHandle(printer_dev->stopEvent);
+		(void)CloseHandle(printer_dev->event);
+		Queue_Free(printer_dev->pIrpList);
+	}
 
 	if (printer_dev->printer)
 	{
@@ -912,9 +1011,10 @@ static UINT printer_free(DEVICE* device)
  *
  * @return 0 on success, otherwise a Win32 error code
  */
+WINPR_ATTR_NODISCARD
 static UINT printer_register(PDEVICE_SERVICE_ENTRY_POINTS pEntryPoints, rdpPrinter* printer)
 {
-	PRINTER_DEVICE* printer_dev;
+	PRINTER_DEVICE* printer_dev = nullptr;
 	UINT error = ERROR_INTERNAL_ERROR;
 
 	WINPR_ASSERT(pEntryPoints);
@@ -928,12 +1028,12 @@ static UINT printer_register(PDEVICE_SERVICE_ENTRY_POINTS pEntryPoints, rdpPrint
 		return CHANNEL_RC_NO_MEMORY;
 	}
 
-	printer_dev->device.data = Stream_New(NULL, 1024);
+	printer_dev->device.data = Stream_New(nullptr, 1024);
 
 	if (!printer_dev->device.data)
 		goto error_out;
 
-	sprintf_s(printer_dev->port, sizeof(printer_dev->port), "PRN%" PRIdz, printer->id);
+	(void)sprintf_s(printer_dev->port, sizeof(printer_dev->port), "PRN%" PRIuz, printer->id);
 	printer_dev->device.type = RDPDR_DTYP_PRINT;
 	printer_dev->device.name = printer_dev->port;
 	printer_dev->device.IRPRequest = printer_irp_request;
@@ -941,47 +1041,58 @@ static UINT printer_register(PDEVICE_SERVICE_ENTRY_POINTS pEntryPoints, rdpPrint
 	printer_dev->device.Free = printer_free;
 	printer_dev->rdpcontext = pEntryPoints->rdpcontext;
 	printer_dev->printer = printer;
-	printer_dev->pIrpList = (WINPR_PSLIST_HEADER)winpr_aligned_malloc(sizeof(WINPR_SLIST_HEADER),
-	                                                                  MEMORY_ALLOCATION_ALIGNMENT);
 
-	if (!printer_dev->pIrpList)
-	{
-		WLog_ERR(TAG, "_aligned_malloc failed!");
-		error = CHANNEL_RC_NO_MEMORY;
-		goto error_out;
-	}
+	if (!freerdp_settings_get_bool(pEntryPoints->rdpcontext->settings,
+	                               FreeRDP_SynchronousStaticChannels))
+		printer_dev->async = TRUE;
 
 	if (!printer_load_from_config(pEntryPoints->rdpcontext->settings, printer, printer_dev))
 		goto error_out;
 
-	InitializeSListHead(printer_dev->pIrpList);
-
-	if (!(printer_dev->event = CreateEvent(NULL, TRUE, FALSE, NULL)))
+	if (printer_dev->async)
 	{
-		WLog_ERR(TAG, "CreateEvent failed!");
-		error = ERROR_INTERNAL_ERROR;
-		goto error_out;
+		printer_dev->pIrpList = Queue_New(TRUE, -1, -1);
+
+		if (!printer_dev->pIrpList)
+		{
+			error = CHANNEL_RC_NO_MEMORY;
+			goto error_out;
+		}
+
+		printer_dev->event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+		if (!printer_dev->event)
+		{
+			WLog_ERR(TAG, "CreateEvent failed!");
+			error = ERROR_INTERNAL_ERROR;
+			goto error_out;
+		}
+
+		printer_dev->stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+		if (!printer_dev->stopEvent)
+		{
+			WLog_ERR(TAG, "CreateEvent failed!");
+			error = ERROR_INTERNAL_ERROR;
+			goto error_out;
+		}
 	}
 
-	if (!(printer_dev->stopEvent = CreateEvent(NULL, TRUE, FALSE, NULL)))
-	{
-		WLog_ERR(TAG, "CreateEvent failed!");
-		error = ERROR_INTERNAL_ERROR;
-		goto error_out;
-	}
-
-	if ((error = pEntryPoints->RegisterDevice(pEntryPoints->devman, &printer_dev->device)))
+	error = pEntryPoints->RegisterDevice(pEntryPoints->devman, &printer_dev->device);
+	if (error)
 	{
 		WLog_ERR(TAG, "RegisterDevice failed with error %" PRIu32 "!", error);
 		goto error_out;
 	}
 
-	if (!(printer_dev->thread =
-	          CreateThread(NULL, 0, printer_thread_func, (void*)printer_dev, 0, NULL)))
+	if (printer_dev->async)
 	{
-		WLog_ERR(TAG, "CreateThread failed!");
-		error = ERROR_INTERNAL_ERROR;
-		goto error_out;
+		printer_dev->thread =
+		    CreateThread(nullptr, 0, printer_thread_func, (void*)printer_dev, 0, nullptr);
+		if (!printer_dev->thread)
+		{
+			WLog_ERR(TAG, "CreateThread failed!");
+			error = ERROR_INTERNAL_ERROR;
+			goto error_out;
+		}
 	}
 
 	WINPR_ASSERT(printer->AddRef);
@@ -992,20 +1103,21 @@ error_out:
 	return error;
 }
 
+WINPR_ATTR_NODISCARD
 static rdpPrinterDriver* printer_load_backend(const char* backend)
 {
-	typedef rdpPrinterDriver* (*backend_load_t)(void);
-	union
-	{
-		PVIRTUALCHANNELENTRY entry;
-		backend_load_t backend;
-	} fktconv;
+	typedef UINT(VCAPITYPE * backend_load_t)(rdpPrinterDriver**);
+	PVIRTUALCHANNELENTRY entry = freerdp_load_channel_addin_entry("printer", backend, nullptr, 0);
+	backend_load_t func = WINPR_FUNC_PTR_CAST(entry, backend_load_t);
+	if (!func)
+		return nullptr;
 
-	fktconv.entry = freerdp_load_channel_addin_entry("printer", backend, NULL, 0);
-	if (!fktconv.entry)
-		return NULL;
+	rdpPrinterDriver* printer = nullptr;
+	const UINT rc = func(&printer);
+	if (rc != CHANNEL_RC_OK)
+		return nullptr;
 
-	return fktconv.backend();
+	return printer;
 }
 
 /**
@@ -1013,14 +1125,14 @@ static rdpPrinterDriver* printer_load_backend(const char* backend)
  *
  * @return 0 on success, otherwise a Win32 error code
  */
-UINT printer_DeviceServiceEntry(PDEVICE_SERVICE_ENTRY_POINTS pEntryPoints)
+FREERDP_ENTRY_POINT(
+    UINT VCAPITYPE printer_DeviceServiceEntry(PDEVICE_SERVICE_ENTRY_POINTS pEntryPoints))
 {
-	int i;
-	char* name;
-	char* driver_name;
+	char* name = nullptr;
+	char* driver_name = nullptr;
 	BOOL default_backend = TRUE;
-	RDPDR_PRINTER* device = NULL;
-	rdpPrinterDriver* driver = NULL;
+	RDPDR_PRINTER* device = nullptr;
+	rdpPrinterDriver* driver = nullptr;
 	UINT error = CHANNEL_RC_OK;
 
 	if (!pEntryPoints || !pEntryPoints->device)
@@ -1069,10 +1181,13 @@ UINT printer_DeviceServiceEntry(PDEVICE_SERVICE_ENTRY_POINTS pEntryPoints)
 		goto fail;
 	}
 
+	if (driver->SetDeviceContext)
+		driver->SetDeviceContext(driver, device);
+
 	if (name && name[0])
 	{
 		WINPR_ASSERT(driver->GetPrinter);
-		rdpPrinter* printer = driver->GetPrinter(driver, name, driver_name);
+		rdpPrinter* printer = driver->GetPrinter(driver, name, driver_name, device->IsDefault);
 
 		if (!printer)
 		{
@@ -1101,17 +1216,22 @@ UINT printer_DeviceServiceEntry(PDEVICE_SERVICE_ENTRY_POINTS pEntryPoints)
 	{
 		WINPR_ASSERT(driver->EnumPrinters);
 		rdpPrinter** printers = driver->EnumPrinters(driver);
-		rdpPrinter** current = printers;
-
-		for (i = 0; current[i]; i++)
+		if (printers)
 		{
-			rdpPrinter* printer = current[i];
-
-			if ((error = printer_register(pEntryPoints, printer)))
+			for (rdpPrinter** current = printers; *current; ++current)
 			{
-				WLog_ERR(TAG, "printer_register failed with error %" PRIu32 "!", error);
-				break;
+				error = printer_register(pEntryPoints, *current);
+				if (error)
+				{
+					WLog_ERR(TAG, "printer_register failed with error %" PRIu32 "!", error);
+					break;
+				}
 			}
+		}
+		else
+		{
+			WLog_ERR(TAG, "Failed to enumerate printers!");
+			error = CHANNEL_RC_INITIALIZATION_ERROR;
 		}
 
 		WINPR_ASSERT(driver->ReleaseEnumPrinters);

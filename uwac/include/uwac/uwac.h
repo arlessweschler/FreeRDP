@@ -26,8 +26,14 @@
 #include <wayland-client.h>
 #include <stdbool.h>
 
-#if __GNUC__ >= 4
+#if defined(__GNUC__) && (__GNUC__ >= 4)
+#if defined(__cplusplus) && (__cplusplus >= 201703L)
+#define UWAC_API [[gnu::visibility("default")]]
+#elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 202311L)
+#define UWAC_API [[gnu::visibility("default")]]
+#else
 #define UWAC_API __attribute__((visibility("default")))
+#endif
 #else
 #define UWAC_API
 #endif
@@ -261,6 +267,7 @@ struct uwac_key_event
 	uint32_t raw_key;
 	uint32_t sym;
 	bool pressed;
+	bool repeated;
 };
 typedef struct uwac_key_event UwacKeyEvent;
 
@@ -342,7 +349,7 @@ extern "C"
 	UWAC_API void UwacInstallErrorHandler(UwacErrorHandler handler);
 
 	/**
-	 *	Opens the corresponding wayland display, using NULL you will open the default
+	 *	Opens the corresponding wayland display, using nullptr you will open the default
 	 *	display.
 	 *
 	 * @param name the name of the display to open
@@ -429,10 +436,19 @@ extern "C"
 	 *
 	 * @param display the display to query
 	 * @param index index of the output
-	 * @return the given UwacOutput, NULL if something failed (so you should query
+	 * @return the given UwacOutput, nullptr if something failed (so you should query
 	 *UwacDisplayGetLastError() to have the reason)
 	 */
 	UWAC_API const UwacOutput* UwacDisplayGetOutput(UwacDisplay* display, int index);
+
+	/**
+	 * Checks whether the compositor advertises the linux-dmabuf protocol.
+	 *
+	 * @param display the display to query
+	 * @return true if linux-dmabuf is available
+	 * @since version 3.33.0
+	 */
+	UWAC_API bool UwacDisplayHasLinuxDmabuf(const UwacDisplay* display);
 
 	/**
 	 * retrieve the resolution of a given UwacOutput
@@ -457,9 +473,9 @@ extern "C"
 	 *
 	 * @param display the display to attach the window to
 	 * @param width the width of the window
-	 * @param height the heigh of the window
+	 * @param height the height of the window
 	 * @param format format to use for the SHM surface
-	 * @return the created UwacWindow, NULL if something failed (use UwacDisplayGetLastError() to
+	 * @return the created UwacWindow, nullptr if something failed (use UwacDisplayGetLastError() to
 	 *know more about this)
 	 */
 	UWAC_API UwacWindow* UwacCreateWindowShm(UwacDisplay* display, uint32_t width, uint32_t height,
@@ -642,8 +658,8 @@ extern "C"
 
 	/**
 	 * @brief UwacSeatSetMouseCursor Sets the specified image as the new mouse cursor.
-	 *                               Special values: If data == NULL && lenght == 0
-	 *                               the cursor is hidden, if data == NULL && length != 0
+	 *                               Special values: If data == nullptr && length == 0
+	 *                               the cursor is hidden, if data == nullptr && length != 0
 	 *                               the default system cursor is used.
 	 *
 	 * @param seat   The UwacSeat to apply the cursor image to

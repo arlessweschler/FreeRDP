@@ -55,14 +55,12 @@
 
 #include <winpr/crt.h>
 
-#ifdef HAVE_UNISTD_H
+#ifdef WINPR_HAVE_UNISTD_H
 #include <unistd.h>
 #endif
 
-#if defined(HAVE_GETPWUID_R)
+#if defined(WINPR_HAVE_GETPWUID_R)
 #include <sys/types.h>
-#include <pwd.h>
-#include <unistd.h>
 #endif
 
 #include <pthread.h>
@@ -101,43 +99,42 @@ BOOL LogonUserCloseHandle(HANDLE handle)
 		return FALSE;
 
 	free(token->Username);
+	token->Username = nullptr;
 	free(token->Domain);
-	free(token);
+	token->Domain = nullptr;
 	return TRUE;
 }
 
 static HANDLE_OPS ops = { LogonUserIsHandled,
 	                      LogonUserCloseHandle,
 	                      LogonUserGetFd,
-	                      NULL, /* CleanupHandle */
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL,
-	                      NULL };
+	                      nullptr, /* CleanupHandle */
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr,
+	                      nullptr };
 
-BOOL LogonUserA(LPCSTR lpszUsername, LPCSTR lpszDomain, LPCSTR lpszPassword, DWORD dwLogonType,
-                DWORD dwLogonProvider, PHANDLE phToken)
+BOOL LogonUserA(LPCSTR lpszUsername, LPCSTR lpszDomain, WINPR_ATTR_UNUSED LPCSTR lpszPassword,
+                WINPR_ATTR_UNUSED DWORD dwLogonType, WINPR_ATTR_UNUSED DWORD dwLogonProvider,
+                PHANDLE phToken)
 {
-	struct passwd* pw;
-	WINPR_ACCESS_TOKEN* token;
-
 	if (!lpszUsername)
 		return FALSE;
 
-	token = (WINPR_ACCESS_TOKEN*)calloc(1, sizeof(WINPR_ACCESS_TOKEN));
+	WINPR_ACCESS_TOKEN* token = (WINPR_ACCESS_TOKEN*)calloc(1, sizeof(WINPR_ACCESS_TOKEN));
 
 	if (!token)
 		return FALSE;
@@ -147,52 +144,78 @@ BOOL LogonUserA(LPCSTR lpszUsername, LPCSTR lpszDomain, LPCSTR lpszPassword, DWO
 	token->Username = _strdup(lpszUsername);
 
 	if (!token->Username)
-	{
-		free(token);
-		return FALSE;
-	}
+		goto fail;
 
 	if (lpszDomain)
 	{
 		token->Domain = _strdup(lpszDomain);
 
 		if (!token->Domain)
+			goto fail;
+	}
+
+	{
+		long buflen = sysconf(_SC_GETPW_R_SIZE_MAX);
+		if (buflen < 0)
+			buflen = 8196;
+
 		{
-			free(token->Username);
-			free(token);
-			return FALSE;
+			const size_t s = 1ULL + (size_t)buflen;
+			char* buf = (char*)calloc(s, sizeof(char));
+			if (!buf)
+				goto fail;
+
+			{
+				struct passwd pwd = WINPR_C_ARRAY_INIT;
+				struct passwd* pw = nullptr;
+				const int rc = getpwnam_r(lpszUsername, &pwd, buf,
+				                          WINPR_ASSERTING_INT_CAST(size_t, buflen), &pw);
+				free(buf);
+				if ((rc == 0) && pw)
+				{
+					token->UserId = (DWORD)pw->pw_uid;
+					token->GroupId = (DWORD)pw->pw_gid;
+				}
+
+				*((ULONG_PTR*)phToken) = (ULONG_PTR)token;
+				return TRUE;
+			}
 		}
 	}
+fail:
+	free(token->Username);
+	free(token->Domain);
+	free(token);
+	return FALSE;
+}
 
-	pw = getpwnam(lpszUsername);
-
-	if (pw)
-	{
-		token->UserId = (DWORD)pw->pw_uid;
-		token->GroupId = (DWORD)pw->pw_gid;
-	}
-
-	*((ULONG_PTR*)phToken) = (ULONG_PTR)token;
+BOOL LogonUserW(WINPR_ATTR_UNUSED LPCWSTR lpszUsername, WINPR_ATTR_UNUSED LPCWSTR lpszDomain,
+                WINPR_ATTR_UNUSED LPCWSTR lpszPassword, WINPR_ATTR_UNUSED DWORD dwLogonType,
+                WINPR_ATTR_UNUSED DWORD dwLogonProvider, WINPR_ATTR_UNUSED PHANDLE phToken)
+{
+	WLog_ERR("TODO", "TODO: implement");
 	return TRUE;
 }
 
-BOOL LogonUserW(LPCWSTR lpszUsername, LPCWSTR lpszDomain, LPCWSTR lpszPassword, DWORD dwLogonType,
-                DWORD dwLogonProvider, PHANDLE phToken)
+BOOL LogonUserExA(WINPR_ATTR_UNUSED LPCSTR lpszUsername, WINPR_ATTR_UNUSED LPCSTR lpszDomain,
+                  WINPR_ATTR_UNUSED LPCSTR lpszPassword, WINPR_ATTR_UNUSED DWORD dwLogonType,
+                  WINPR_ATTR_UNUSED DWORD dwLogonProvider, WINPR_ATTR_UNUSED PHANDLE phToken,
+                  WINPR_ATTR_UNUSED PSID* ppLogonSid, WINPR_ATTR_UNUSED PVOID* ppProfileBuffer,
+                  WINPR_ATTR_UNUSED LPDWORD pdwProfileLength,
+                  WINPR_ATTR_UNUSED PQUOTA_LIMITS pQuotaLimits)
 {
+	WLog_ERR("TODO", "TODO: implement");
 	return TRUE;
 }
 
-BOOL LogonUserExA(LPCSTR lpszUsername, LPCSTR lpszDomain, LPCSTR lpszPassword, DWORD dwLogonType,
-                  DWORD dwLogonProvider, PHANDLE phToken, PSID* ppLogonSid, PVOID* ppProfileBuffer,
-                  LPDWORD pdwProfileLength, PQUOTA_LIMITS pQuotaLimits)
+BOOL LogonUserExW(WINPR_ATTR_UNUSED LPCWSTR lpszUsername, WINPR_ATTR_UNUSED LPCWSTR lpszDomain,
+                  WINPR_ATTR_UNUSED LPCWSTR lpszPassword, WINPR_ATTR_UNUSED DWORD dwLogonType,
+                  WINPR_ATTR_UNUSED DWORD dwLogonProvider, WINPR_ATTR_UNUSED PHANDLE phToken,
+                  WINPR_ATTR_UNUSED PSID* ppLogonSid, WINPR_ATTR_UNUSED PVOID* ppProfileBuffer,
+                  WINPR_ATTR_UNUSED LPDWORD pdwProfileLength,
+                  WINPR_ATTR_UNUSED PQUOTA_LIMITS pQuotaLimits)
 {
-	return TRUE;
-}
-
-BOOL LogonUserExW(LPCWSTR lpszUsername, LPCWSTR lpszDomain, LPCWSTR lpszPassword, DWORD dwLogonType,
-                  DWORD dwLogonProvider, PHANDLE phToken, PSID* ppLogonSid, PVOID* ppProfileBuffer,
-                  LPDWORD pdwProfileLength, PQUOTA_LIMITS pQuotaLimits)
-{
+	WLog_ERR("TODO", "TODO: implement");
 	return TRUE;
 }
 
@@ -204,20 +227,20 @@ BOOL GetUserNameExA(EXTENDED_NAME_FORMAT NameFormat, LPSTR lpNameBuffer, PULONG 
 	switch (NameFormat)
 	{
 		case NameSamCompatible:
-#if defined(HAVE_GETPWUID_R)
+#if defined(WINPR_HAVE_GETPWUID_R)
 		{
-			int rc;
-			struct passwd pwd = { 0 };
-			struct passwd* result = NULL;
+			int rc = 0;
+			struct passwd pwd = WINPR_C_ARRAY_INIT;
+			struct passwd* result = nullptr;
 			uid_t uid = getuid();
 
 			rc = getpwuid_r(uid, &pwd, lpNameBuffer, *nSize, &result);
 			if (rc != 0)
 				return FALSE;
-			if (result == NULL)
+			if (result == nullptr)
 				return FALSE;
 		}
-#elif defined(HAVE_GETLOGIN_R)
+#elif defined(WINPR_HAVE_GETLOGIN_R)
 			if (getlogin_r(lpNameBuffer, *nSize) != 0)
 				return FALSE;
 #else
@@ -228,7 +251,12 @@ BOOL GetUserNameExA(EXTENDED_NAME_FORMAT NameFormat, LPSTR lpNameBuffer, PULONG 
 			strncpy(lpNameBuffer, name, strnlen(name, *nSize));
 		}
 #endif
-			*nSize = strnlen(lpNameBuffer, *nSize);
+			{
+				const size_t len = strnlen(lpNameBuffer, *nSize);
+				if (len > UINT32_MAX)
+					return FALSE;
+				*nSize = (ULONG)len;
+			}
 			return TRUE;
 
 		case NameFullyQualifiedDN:
@@ -250,9 +278,8 @@ BOOL GetUserNameExA(EXTENDED_NAME_FORMAT NameFormat, LPSTR lpNameBuffer, PULONG 
 
 BOOL GetUserNameExW(EXTENDED_NAME_FORMAT NameFormat, LPWSTR lpNameBuffer, PULONG nSize)
 {
-	int res;
 	BOOL rc = FALSE;
-	char* name;
+	char* name = nullptr;
 
 	WINPR_ASSERT(nSize);
 	WINPR_ASSERT(lpNameBuffer);
@@ -264,11 +291,13 @@ BOOL GetUserNameExW(EXTENDED_NAME_FORMAT NameFormat, LPWSTR lpNameBuffer, PULONG
 	if (!GetUserNameExA(NameFormat, name, nSize))
 		goto fail;
 
-	res = ConvertToUnicode(CP_UTF8, 0, name, -1, &lpNameBuffer, *nSize);
-	if (res < 0)
-		goto fail;
+	{
+		const SSIZE_T res = ConvertUtf8ToWChar(name, lpNameBuffer, *nSize);
+		if ((res < 0) || (res >= UINT32_MAX))
+			goto fail;
 
-	*nSize = res + 1;
+		*nSize = (UINT32)res + 1;
+	}
 	rc = TRUE;
 fail:
 	free(name);

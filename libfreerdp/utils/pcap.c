@@ -27,26 +27,7 @@
 #include <winpr/assert.h>
 #include <winpr/file.h>
 #include <winpr/crt.h>
-#include <freerdp/log.h>
-
-#define TAG FREERDP_TAG("utils")
-
-#ifndef _WIN32
-#include <sys/time.h>
-#else
-#include <time.h>
-#include <sys/timeb.h>
-#include <winpr/windows.h>
-
-int gettimeofday(struct timeval* tp, void* tz)
-{
-	struct _timeb timebuffer;
-	_ftime(&timebuffer);
-	tp->tv_sec = (long)timebuffer.time;
-	tp->tv_usec = timebuffer.millitm * 1000;
-	return 0;
-}
-#endif
+#include <winpr/sysinfo.h>
 
 #include <freerdp/types.h>
 #include <freerdp/utils/pcap.h>
@@ -114,7 +95,7 @@ static BOOL pcap_read_record(rdpPcap* pcap, pcap_record* record)
 	if (fread(record->data, record->length, 1, pcap->fp) != 1)
 	{
 		free(record->data);
-		record->data = NULL;
+		record->data = nullptr;
 		return FALSE;
 	}
 	return TRUE;
@@ -131,27 +112,25 @@ static BOOL pcap_write_record(rdpPcap* pcap, const pcap_record* record)
 
 BOOL pcap_add_record(rdpPcap* pcap, const void* data, size_t length)
 {
-	pcap_record* record;
-	struct timeval tp;
-
 	WINPR_ASSERT(pcap);
 	WINPR_ASSERT(data || (length == 0));
 	WINPR_ASSERT(length <= UINT32_MAX);
 
-	record = (pcap_record*)calloc(1, sizeof(pcap_record));
+	pcap_record* record = (pcap_record*)calloc(1, sizeof(pcap_record));
 	if (!record)
 		return FALSE;
 
 	record->cdata = data;
-	record->length = length;
+	record->length = (UINT32)length;
 	record->header.incl_len = (UINT32)length;
 	record->header.orig_len = (UINT32)length;
 
-	gettimeofday(&tp, 0);
-	record->header.ts_sec = (UINT32)tp.tv_sec;
-	record->header.ts_usec = (UINT32)tp.tv_usec;
+	const UINT64 ns = winpr_GetUnixTimeNS();
 
-	if (pcap->tail == NULL)
+	record->header.ts_sec = (UINT32)WINPR_TIME_NS_TO_S(ns);
+	record->header.ts_usec = (UINT32)WINPR_TIME_NS_REM_US(ns);
+
+	if (pcap->tail == nullptr)
 	{
 		pcap->tail = record;
 		if (!pcap->tail)
@@ -165,7 +144,7 @@ BOOL pcap_add_record(rdpPcap* pcap, const void* data, size_t length)
 		pcap->tail = record;
 	}
 
-	if (pcap->record == NULL)
+	if (pcap->record == nullptr)
 		pcap->record = record;
 
 	return TRUE;
@@ -175,10 +154,7 @@ BOOL pcap_has_next_record(const rdpPcap* pcap)
 {
 	WINPR_ASSERT(pcap);
 
-	if (pcap->file_size - (_ftelli64(pcap->fp)) <= 16)
-		return FALSE;
-
-	return TRUE;
+	return (pcap->file_size - (_ftelli64(pcap->fp)) > 16);
 }
 
 BOOL pcap_get_next_record_header(rdpPcap* pcap, pcap_record* record)
@@ -213,20 +189,21 @@ BOOL pcap_get_next_record(rdpPcap* pcap, pcap_record* record)
 
 rdpPcap* pcap_open(const char* name, BOOL write)
 {
-	rdpPcap* pcap;
-
 	WINPR_ASSERT(name);
 
-	pcap = (rdpPcap*)calloc(1, sizeof(rdpPcap));
+	rdpPcap* pcap = (rdpPcap*)calloc(1, sizeof(rdpPcap));
 	if (!pcap)
 		goto fail;
 
 	pcap->name = _strdup(name);
+	if (!pcap->name)
+		goto fail;
+
 	pcap->write = write;
 	pcap->record_count = 0;
 	pcap->fp = winpr_fopen(name, write ? "w+b" : "rb");
 
-	if (pcap->fp == NULL)
+	if (pcap->fp == nullptr)
 		goto fail;
 
 	if (write)
@@ -243,9 +220,11 @@ rdpPcap* pcap_open(const char* name, BOOL write)
 	}
 	else
 	{
-		_fseeki64(pcap->fp, 0, SEEK_END);
+		if (_fseeki64(pcap->fp, 0, SEEK_END) != 0)
+			goto fail;
 		pcap->file_size = _ftelli64(pcap->fp);
-		_fseeki64(pcap->fp, 0, SEEK_SET);
+		if (_fseeki64(pcap->fp, 0, SEEK_SET) != 0)
+			goto fail;
 		if (!pcap_read_header(pcap, &pcap->header))
 			goto fail;
 	}
@@ -254,21 +233,23 @@ rdpPcap* pcap_open(const char* name, BOOL write)
 
 fail:
 	pcap_close(pcap);
-	return NULL;
+	return nullptr;
 }
 
 void pcap_flush(rdpPcap* pcap)
 {
 	WINPR_ASSERT(pcap);
 
-	while (pcap->record != NULL)
+	while (pcap->record != nullptr)
 	{
-		pcap_write_record(pcap, pcap->record);
-		pcap->record = pcap->record->next;
+		(void)pcap_write_record(pcap, pcap->record);
+		pcap_record* next = pcap->record->next;
+		free(pcap->record);
+		pcap->record = next;
 	}
 
-	if (pcap->fp != NULL)
-		fflush(pcap->fp);
+	if (pcap->fp != nullptr)
+		(void)fflush(pcap->fp);
 }
 
 void pcap_close(rdpPcap* pcap)
@@ -278,8 +259,8 @@ void pcap_close(rdpPcap* pcap)
 
 	pcap_flush(pcap);
 
-	if (pcap->fp != NULL)
-		fclose(pcap->fp);
+	if (pcap->fp != nullptr)
+		(void)fclose(pcap->fp);
 
 	free(pcap->name);
 	free(pcap);

@@ -13,10 +13,10 @@ static const BYTE TEST_BELLS_NCRUSH[] =
 static BOOL test_NCrushCompressBells(void)
 {
 	BOOL rc = FALSE;
-	int status;
-	UINT32 Flags;
-	const BYTE* pDstData = NULL;
-	BYTE OutputBuffer[65536] = { 0 };
+	int status = 0;
+	UINT32 Flags = 0;
+	const BYTE* pDstData = nullptr;
+	BYTE OutputBuffer[65536] = WINPR_C_ARRAY_INIT;
 	const UINT32 SrcSize = sizeof(TEST_BELLS_DATA) - 1;
 	const BYTE* pSrcData = TEST_BELLS_DATA;
 	const UINT32 expectedSize = sizeof(TEST_BELLS_NCRUSH) - 1;
@@ -39,9 +39,9 @@ static BOOL test_NCrushCompressBells(void)
 		       "\n",
 		       DstSize, expectedSize);
 		printf("Actual\n");
-		BitDump(__FUNCTION__, WLOG_INFO, pDstData, DstSize * 8, 0);
+		BitDump(__func__, WLOG_INFO, pDstData, DstSize * 8, 0);
 		printf("Expected\n");
-		BitDump(__FUNCTION__, WLOG_INFO, TEST_BELLS_NCRUSH, expectedSize * 8, 0);
+		BitDump(__func__, WLOG_INFO, TEST_BELLS_NCRUSH, expectedSize * 8, 0);
 		goto fail;
 	}
 
@@ -49,9 +49,9 @@ static BOOL test_NCrushCompressBells(void)
 	{
 		printf("NCrushCompressBells: output mismatch\n");
 		printf("Actual\n");
-		BitDump(__FUNCTION__, WLOG_INFO, pDstData, DstSize * 8, 0);
+		BitDump(__func__, WLOG_INFO, pDstData, DstSize * 8, 0);
 		printf("Expected\n");
-		BitDump(__FUNCTION__, WLOG_INFO, TEST_BELLS_NCRUSH, expectedSize * 8, 0);
+		BitDump(__func__, WLOG_INFO, TEST_BELLS_NCRUSH, expectedSize * 8, 0);
 		goto fail;
 	}
 
@@ -64,13 +64,13 @@ fail:
 static BOOL test_NCrushDecompressBells(void)
 {
 	BOOL rc = FALSE;
-	int status;
-	UINT32 Flags;
-	const BYTE* pSrcData;
-	UINT32 SrcSize;
-	UINT32 DstSize;
-	UINT32 expectedSize;
-	const BYTE* pDstData = NULL;
+	int status = 0;
+	UINT32 Flags = 0;
+	const BYTE* pSrcData = nullptr;
+	UINT32 SrcSize = 0;
+	UINT32 DstSize = 0;
+	UINT32 expectedSize = 0;
+	const BYTE* pDstData = nullptr;
 	NCRUSH_CONTEXT* ncrush = ncrush_context_new(FALSE);
 
 	if (!ncrush)

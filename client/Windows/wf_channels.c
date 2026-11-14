@@ -50,9 +50,6 @@ void wf_OnChannelConnectedEventHandler(void* context, const ChannelConnectedEven
 	{
 		wf_cliprdr_init(wfc, (CliprdrClientContext*)e->pInterface);
 	}
-	else if (strcmp(e->name, ENCOMSP_SVC_CHANNEL_NAME) == 0)
-	{
-	}
 	else if (strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0)
 	{
 		wfc->disp = (DispClientContext*)e->pInterface;
@@ -80,12 +77,9 @@ void wf_OnChannelDisconnectedEventHandler(void* context, const ChannelDisconnect
 	{
 		wf_cliprdr_uninit(wfc, (CliprdrClientContext*)e->pInterface);
 	}
-	else if (strcmp(e->name, ENCOMSP_SVC_CHANNEL_NAME) == 0)
-	{
-	}
 	else if (strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0)
 	{
-		wfc->disp = NULL;
+		wfc->disp = nullptr;
 	}
 	else
 		freerdp_client_OnChannelDisconnectedEventHandler(context, e);

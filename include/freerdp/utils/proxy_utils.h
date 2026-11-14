@@ -22,12 +22,21 @@
 #define FREERDP_PROXY_UTILS_H
 
 #include <freerdp/api.h>
+#include <freerdp/settings.h>
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
+	/** @brief parse a proxy environment variable string and populate settings from it
+	 *
+	 *  @param settings the settings to populate, must not be \b nullptr
+	 *  @param uri_in the proxy string to parse, must not be \b nullptr
+	 *
+	 *  @return \b TRUE if parsed successfully
+	 */
+	WINPR_ATTR_NODISCARD
 	FREERDP_API BOOL proxy_parse_uri(rdpSettings* settings, const char* uri_in);
 
 #ifdef __cplusplus

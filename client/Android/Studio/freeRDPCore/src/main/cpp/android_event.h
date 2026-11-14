@@ -13,12 +13,15 @@
 #define FREERDP_CLIENT_ANDROID_EVENT_H
 #include <freerdp/freerdp.h>
 #include <freerdp/api.h>
+#include <freerdp/client.h>
+#include <winpr/synch.h>
 
 #define EVENT_TYPE_KEY 1
 #define EVENT_TYPE_CURSOR 2
 #define EVENT_TYPE_DISCONNECT 3
 #define EVENT_TYPE_KEY_UNICODE 4
 #define EVENT_TYPE_CLIPBOARD 5
+#define EVENT_TYPE_KEY_AS_UNICODE 6
 
 typedef struct
 {
@@ -36,6 +39,15 @@ typedef struct
 {
 	int type;
 	UINT16 flags;
+	UINT32 scancode;
+	UINT32 modmask;
+	char str[5];
+} ANDROID_EVENT_KEY_AS_UNICODE;
+
+typedef struct
+{
+	int type;
+	UINT16 flags;
 	UINT16 x;
 	UINT16 y;
 } ANDROID_EVENT_CURSOR;
@@ -45,13 +57,15 @@ typedef struct
 	int type;
 	void* data;
 	int data_length;
+	char* mimeType;
 } ANDROID_EVENT_CLIPBOARD;
 
 typedef struct
 {
-	int size;
-	int count;
+	size_t size;
+	size_t count;
 	HANDLE isSet;
+	CRITICAL_SECTION lock;
 	ANDROID_EVENT** events;
 } ANDROID_EVENT_QUEUE;
 
@@ -62,10 +76,13 @@ FREERDP_LOCAL BOOL android_check_handle(freerdp* inst);
 
 FREERDP_LOCAL ANDROID_EVENT_KEY* android_event_key_new(int flags, UINT16 scancode);
 FREERDP_LOCAL ANDROID_EVENT_KEY* android_event_unicodekey_new(UINT16 flags, UINT16 key);
+FREERDP_LOCAL ANDROID_EVENT_KEY_AS_UNICODE*
+android_event_key_as_unicode_new(UINT16 flags, UINT32 scancode, const WCHAR* wstr, size_t wlen,
+                                 UINT32 modmask);
 FREERDP_LOCAL ANDROID_EVENT_CURSOR* android_event_cursor_new(UINT16 flags, UINT16 x, UINT16 y);
 FREERDP_LOCAL ANDROID_EVENT* android_event_disconnect_new(void);
-FREERDP_LOCAL ANDROID_EVENT_CLIPBOARD* android_event_clipboard_new(const void* data,
-                                                                   size_t data_length);
+FREERDP_LOCAL ANDROID_EVENT_CLIPBOARD*
+android_event_clipboard_new(const void* data, size_t data_length, const char* mimeType);
 
 FREERDP_LOCAL void android_event_free(ANDROID_EVENT* event);
 

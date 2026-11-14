@@ -14,9 +14,9 @@ static char* val3 = "val3";
 static int test_hash_table_pointer(void)
 {
 	int rc = -1;
-	size_t count;
-	char* value;
-	wHashTable* table;
+	size_t count = 0;
+	char* value = nullptr;
+	wHashTable* table = nullptr;
 	table = HashTable_New(TRUE);
 
 	if (!table)
@@ -150,8 +150,8 @@ fail:
 static int test_hash_table_string(void)
 {
 	int rc = -1;
-	size_t count;
-	char* value;
+	size_t count = 0;
+	char* value = nullptr;
 	wHashTable* table = HashTable_New(TRUE);
 
 	if (!table)
@@ -288,8 +288,8 @@ fail:
 typedef struct
 {
 	wHashTable* table;
-	int strlenCounter;
-	int foreachCalls;
+	size_t strlenCounter;
+	size_t foreachCalls;
 
 	BOOL test3error;
 } ForeachData;
@@ -309,9 +309,7 @@ static BOOL foreachFn2(const void* key, void* value, void* arg)
 	WINPR_UNUSED(value);
 	d->foreachCalls++;
 
-	if (d->foreachCalls == 2)
-		return FALSE;
-	return TRUE;
+	return (d->foreachCalls != 2);
 }
 
 static BOOL foreachFn3(const void* key, void* value, void* arg)
@@ -322,6 +320,8 @@ static BOOL foreachFn3(const void* key, void* value, void* arg)
 	ForeachData d2;
 
 	WINPR_UNUSED(value);
+	WINPR_ASSERT(keyStr);
+
 	if (strcmp(keyStr, "key1") == 0)
 	{
 		/* when we pass on key1, let's remove key2 and check that the value is not
@@ -368,7 +368,7 @@ static BOOL foreachFn3(const void* key, void* value, void* arg)
 static int test_hash_foreach(void)
 {
 	ForeachData foreachData;
-	wHashTable* table;
+	wHashTable* table = nullptr;
 	int retCode = 0;
 
 	foreachData.table = table = HashTable_New(TRUE);
@@ -429,6 +429,114 @@ out:
 	return retCode;
 }
 
+static size_t earlyExitFreed = 0;
+
+static void earlyExitValueFree(void* value)
+{
+	/* HashTable_Insert also calls the free function with nullptr, don't count that */
+	if (value)
+		earlyExitFreed++;
+	free(value);
+}
+
+static BOOL foreachStopFirst(WINPR_ATTR_UNUSED const void* key, WINPR_ATTR_UNUSED void* value,
+                             WINPR_ATTR_UNUSED void* arg)
+{
+	return FALSE;
+}
+
+static BOOL foreachRemoveAndStop(const void* key, WINPR_ATTR_UNUSED void* value, void* arg)
+{
+	wHashTable* table = arg;
+	(void)HashTable_Remove(table, key);
+	return FALSE;
+}
+
+static BOOL insertEarlyExitValues(wHashTable* table, size_t count)
+{
+	// NOLINTBEGIN(clang-analyzer-unix.Malloc): HashTable_Insert takes ownership of listener
+	for (size_t i = 1; i <= count; i++)
+	{
+		int* value = calloc(1, sizeof(int));
+		if (!value)
+			return FALSE;
+		if (!HashTable_Insert(table, (const void*)i, value))
+		{
+			free(value);
+			return FALSE;
+		}
+	}
+	// NOLINTEND(clang-analyzer-unix.Malloc): HashTable_Insert takes ownership of listener
+	return TRUE;
+}
+
+/** regression: a HashTable_Foreach interrupted by its callback must leave the table usable,
+ *  later removals have to free the values and not only mark them */
+static int test_hash_foreach_early_exit(void)
+{
+	int retCode = 0;
+	wHashTable* table = HashTable_New(FALSE);
+	if (!table)
+		return -1;
+
+	wObject* obj = HashTable_ValueObject(table);
+	obj->fnObjectFree = earlyExitValueFree;
+	earlyExitFreed = 0;
+
+	if (!insertEarlyExitValues(table, 3))
+	{
+		retCode = -2;
+		goto out;
+	}
+
+	/* interrupted foreach, then removals outside of any foreach */
+	if (HashTable_Foreach(table, foreachStopFirst, nullptr))
+	{
+		retCode = -10;
+		goto out;
+	}
+
+	if (!HashTable_Remove(table, (const void*)1))
+	{
+		retCode = -11;
+		goto out;
+	}
+	if ((earlyExitFreed != 1) || (HashTable_Count(table) != 2) ||
+	    HashTable_Contains(table, (const void*)1))
+	{
+		retCode = -12;
+		goto out;
+	}
+
+	HashTable_Clear(table);
+	if ((earlyExitFreed != 3) || (HashTable_Count(table) != 0))
+	{
+		retCode = -13;
+		goto out;
+	}
+
+	/* the callback removes the current item then stops: it is freed when Foreach returns */
+	if (!insertEarlyExitValues(table, 2))
+	{
+		retCode = -20;
+		goto out;
+	}
+	if (HashTable_Foreach(table, foreachRemoveAndStop, table))
+	{
+		retCode = -21;
+		goto out;
+	}
+	if ((earlyExitFreed != 4) || (HashTable_Count(table) != 1))
+	{
+		retCode = -22;
+		goto out;
+	}
+
+out:
+	HashTable_Free(table);
+	return retCode;
+}
+
 int TestHashTable(int argc, char* argv[])
 {
 	WINPR_UNUSED(argc);
@@ -442,5 +550,8 @@ int TestHashTable(int argc, char* argv[])
 
 	if (test_hash_foreach() < 0)
 		return 3;
+
+	if (test_hash_foreach_early_exit() < 0)
+		return 4;
 	return 0;
 }

@@ -48,7 +48,7 @@ typedef struct
 
 static BOOL tsmf_alsa_open_device(TSMFAlsaAudioDevice* alsa)
 {
-	int error;
+	int error = 0;
 	error = snd_pcm_open(&alsa->out_handle, alsa->device, SND_PCM_STREAM_PLAYBACK, 0);
 
 	if (error < 0)
@@ -80,10 +80,10 @@ static BOOL tsmf_alsa_open(ITSMFAudioDevice* audio, const char* device)
 static BOOL tsmf_alsa_set_format(ITSMFAudioDevice* audio, UINT32 sample_rate, UINT32 channels,
                                  UINT32 bits_per_sample)
 {
-	int error;
-	snd_pcm_uframes_t frames;
-	snd_pcm_hw_params_t* hw_params;
-	snd_pcm_sw_params_t* sw_params;
+	int error = 0;
+	snd_pcm_uframes_t frames = 0;
+	snd_pcm_hw_params_t* hw_params = nullptr;
+	snd_pcm_sw_params_t* sw_params = nullptr;
 	TSMFAlsaAudioDevice* alsa = (TSMFAlsaAudioDevice*)audio;
 
 	if (!alsa->out_handle)
@@ -104,7 +104,7 @@ static BOOL tsmf_alsa_set_format(ITSMFAudioDevice* audio, UINT32 sample_rate, UI
 	snd_pcm_hw_params_any(alsa->out_handle, hw_params);
 	snd_pcm_hw_params_set_access(alsa->out_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
 	snd_pcm_hw_params_set_format(alsa->out_handle, hw_params, SND_PCM_FORMAT_S16_LE);
-	snd_pcm_hw_params_set_rate_near(alsa->out_handle, hw_params, &alsa->actual_rate, NULL);
+	snd_pcm_hw_params_set_rate_near(alsa->out_handle, hw_params, &alsa->actual_rate, nullptr);
 	snd_pcm_hw_params_set_channels_near(alsa->out_handle, hw_params, &alsa->actual_channels);
 	frames = sample_rate;
 	snd_pcm_hw_params_set_buffer_size_near(alsa->out_handle, hw_params, &frames);
@@ -141,37 +141,30 @@ static BOOL tsmf_alsa_set_format(ITSMFAudioDevice* audio, UINT32 sample_rate, UI
 
 static BOOL tsmf_alsa_play(ITSMFAudioDevice* audio, const BYTE* src, UINT32 data_size)
 {
-	int len;
-	int error;
-	int frames;
-	const BYTE* end;
-	const BYTE* pindex;
-	int rbytes_per_frame;
-	int sbytes_per_frame;
+	const BYTE* pindex = nullptr;
 	TSMFAlsaAudioDevice* alsa = (TSMFAlsaAudioDevice*)audio;
 	DEBUG_TSMF("data_size %" PRIu32 "", data_size);
 
 	if (alsa->out_handle)
 	{
-		sbytes_per_frame = alsa->source_channels * alsa->bytes_per_sample;
-		rbytes_per_frame = alsa->actual_channels * alsa->bytes_per_sample;
+		const size_t rbytes_per_frame = 1ULL * alsa->actual_channels * alsa->bytes_per_sample;
 		pindex = src;
-		end = pindex + data_size;
+		const BYTE* end = pindex + data_size;
 
 		while (pindex < end)
 		{
-			len = end - pindex;
-			frames = len / rbytes_per_frame;
-			error = snd_pcm_writei(alsa->out_handle, pindex, frames);
+			const size_t len = (size_t)(end - pindex);
+			const size_t frames = len / rbytes_per_frame;
+			snd_pcm_sframes_t error = snd_pcm_writei(alsa->out_handle, pindex, frames);
 
 			if (error == -EPIPE)
 			{
-				snd_pcm_recover(alsa->out_handle, error, 0);
+				snd_pcm_recover(alsa->out_handle, -EPIPE, 0);
 				error = 0;
 			}
 			else if (error < 0)
 			{
-				DEBUG_TSMF("error len %d", error);
+				DEBUG_TSMF("error len %ld", error);
 				snd_pcm_close(alsa->out_handle);
 				alsa->out_handle = 0;
 				tsmf_alsa_open_device(alsa);
@@ -183,7 +176,7 @@ static BOOL tsmf_alsa_play(ITSMFAudioDevice* audio, const BYTE* src, UINT32 data
 			if (error == 0)
 				break;
 
-			pindex += error * rbytes_per_frame;
+			pindex += (size_t)error * rbytes_per_frame;
 		}
 	}
 
@@ -205,7 +198,7 @@ static UINT64 tsmf_alsa_get_latency(ITSMFAudioDevice* audio)
 	return latency;
 }
 
-static BOOL tsmf_alsa_flush(ITSMFAudioDevice* audio)
+static BOOL tsmf_alsa_flush(WINPR_ATTR_UNUSED ITSMFAudioDevice* audio)
 {
 	return TRUE;
 }
@@ -224,16 +217,22 @@ static void tsmf_alsa_free(ITSMFAudioDevice* audio)
 	free(alsa);
 }
 
-ITSMFAudioDevice* alsa_freerdp_tsmf_client_audio_subsystem_entry(void)
+FREERDP_ENTRY_POINT(UINT VCAPITYPE alsa_freerdp_tsmf_client_audio_subsystem_entry(void* ptr))
 {
-	TSMFAlsaAudioDevice* alsa;
-	alsa = (TSMFAlsaAudioDevice*)malloc(sizeof(TSMFAlsaAudioDevice));
-	ZeroMemory(alsa, sizeof(TSMFAlsaAudioDevice));
+	ITSMFAudioDevice** sptr = (ITSMFAudioDevice**)ptr;
+	WINPR_ASSERT(sptr);
+	*sptr = nullptr;
+
+	TSMFAlsaAudioDevice* alsa = calloc(1, sizeof(TSMFAlsaAudioDevice));
+	if (!alsa)
+		return ERROR_OUTOFMEMORY;
+
 	alsa->iface.Open = tsmf_alsa_open;
 	alsa->iface.SetFormat = tsmf_alsa_set_format;
 	alsa->iface.Play = tsmf_alsa_play;
 	alsa->iface.GetLatency = tsmf_alsa_get_latency;
 	alsa->iface.Flush = tsmf_alsa_flush;
 	alsa->iface.Free = tsmf_alsa_free;
-	return (ITSMFAudioDevice*)alsa;
+	*sptr = &alsa->iface;
+	return CHANNEL_RC_OK;
 }

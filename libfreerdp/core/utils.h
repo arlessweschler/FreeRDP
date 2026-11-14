@@ -24,24 +24,126 @@
 #include <winpr/winpr.h>
 #include <freerdp/freerdp.h>
 
+#include "../crypto/tls.h"
+
+/* HTTP tunnel redir flags. */
+#define HTTP_TUNNEL_REDIR_ENABLE_ALL 0x80000000
+#define HTTP_TUNNEL_REDIR_DISABLE_ALL 0x40000000
+#define HTTP_TUNNEL_REDIR_DISABLE_DRIVE 0x1
+#define HTTP_TUNNEL_REDIR_DISABLE_PRINTER 0x2
+#define HTTP_TUNNEL_REDIR_DISABLE_PORT 0x4
+#define HTTP_TUNNEL_REDIR_DISABLE_CLIPBOARD 0x8
+#define HTTP_TUNNEL_REDIR_DISABLE_PNP 0x10
+
 typedef enum
 {
 	AUTH_SUCCESS,
 	AUTH_SKIP,
 	AUTH_NO_CREDENTIALS,
+	AUTH_CANCELLED,
 	AUTH_FAILED
 } auth_status;
 
-auth_status utils_authenticate_gateway(freerdp* instance, rdp_auth_reason reason);
-auth_status utils_authenticate(freerdp* instance, rdp_auth_reason reason, BOOL override);
+WINPR_ATTR_NODISCARD FREERDP_LOCAL auth_status utils_authenticate_gateway(freerdp* instance,
+                                                                          rdp_auth_reason reason);
 
-HANDLE utils_get_abort_event(rdpRdp* rdp);
-BOOL utils_abort_event_is_set(rdpRdp* rdp);
-BOOL utils_reset_abort(rdpRdp* rdp);
-BOOL utils_abort_connect(rdpRdp* rdp);
-BOOL utils_sync_credentials(rdpSettings* settings, BOOL toGateway);
+WINPR_ATTR_NODISCARD FREERDP_LOCAL auth_status utils_authenticate(freerdp* instance,
+                                                                  rdp_auth_reason reason,
+                                                                  BOOL override);
 
-BOOL utils_str_is_empty(const char* str);
-BOOL utils_str_copy(const char* value, char** dst);
+WINPR_ATTR_NODISCARD FREERDP_LOCAL HANDLE utils_get_abort_event(rdpRdp* rdp);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL BOOL utils_abort_event_is_set(const rdpRdp* rdp);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL BOOL utils_reset_abort(rdpRdp* rdp);
+
+FREERDP_LOCAL BOOL utils_abort_connect(rdpRdp* rdp);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL BOOL utils_sync_credentials(rdpSettings* settings,
+                                                               BOOL toGateway);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL BOOL utils_persist_credentials(rdpSettings* settings,
+                                                                  const rdpSettings* current);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL BOOL utils_str_is_empty(const char* str);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL BOOL utils_str_copy(const char* value, char** dst);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL const char* utils_is_vsock(const char* hostname);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL BOOL utils_apply_gateway_policy(wLog* log, rdpContext* context,
+                                                                   UINT32 flags,
+                                                                   const char* module);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL char* utils_redir_flags_to_string(UINT32 flags, char* buffer,
+                                                                     size_t size);
+
+WINPR_ATTR_NODISCARD FREERDP_LOCAL BOOL utils_reload_channels(rdpContext* context);
+
+#if !defined(WITHOUT_FREERDP_3x_DEPRECATED)
+/** @brief generate a registry key string of format 'someting\\%s\\foo'
+ *
+ *  @param fmt A format string that must contain a single '%s' being replaced by the
+ * 'vendor\\product` values.
+ *
+ *  @return A registry key to use or \b nullptr if failed.
+ *  @version since 3.23.0
+ */
+WINPR_ATTR_MALLOC(free, 1)
+FREERDP_LOCAL
+char* freerdp_getApplicatonDetailsRegKey(WINPR_FORMAT_ARG const char* fmt);
+#endif
+
+/** @brief generate a 'vendor/product' string with desired separator
+ *
+ *  @param separator the separator character to use
+ *
+ *  @return A 'vendor/product' string to use or \b nullptr if failed.
+ *  @version since 3.23.0
+ */
+WINPR_ATTR_MALLOC(free, 1)
+FREERDP_LOCAL
+char* freerdp_getApplicatonDetailsCombined(char separator);
+
+/** @brief returns if we are using default compile time 'vendor' and 'product' settings or an
+ * application provided one.
+ *
+ *  @return \b TRUE if \b freerdp_setApplicationDetails was called, \b FALSE otherwise.
+ *  @version since 3.23.0
+ */
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL
+BOOL freerdp_areApplicationDetailsCustomized(void);
+
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL const char* guid2str(const GUID* guid, char* buffer, size_t len);
+
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL BOOL utils_is_valid_ip(const char* ipAddress);
+
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL BOOL utils_is_valid_ipV6(const char* ipAddress);
+
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL BOOL utils_is_valid_ipN(const char* ipAddress, size_t len);
+
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL BOOL utils_is_valid_ipV6N(const char* ipAddress, size_t len);
+
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL BOOL utils_compare_ip_strings(const char* ipAddressA, size_t lenA,
+                                            const char* ipAddressB, size_t lenB);
+
+/** @brief sets a file umask so newly created files are only user read/writeable
+ *
+ *  @since version 3.32.0
+ */
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL BOOL utils_set_umask(void);
+
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL BOOL utils_tls_connect(rdpContext* context, rdpTls* tls, wLog* log,
+                                     const char* hostname, UINT16 port, BOOL layerConnect,
+                                     UINT32 timeout);
 
 #endif /* FREERDP_LIB_CORE_UTILS_H */

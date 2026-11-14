@@ -20,11 +20,8 @@
  */
 
 #include <winpr/config.h>
-
-#if defined(__FreeBSD_kernel__) && defined(__GLIBC__)
-#define _GNU_SOURCE
-#define KFREEBSD
-#endif
+#include <winpr/debug.h>
+#include <winpr/assert.h>
 
 #include <winpr/wtypes.h>
 #include <winpr/crt.h>
@@ -43,6 +40,7 @@
 #include <winpr/string.h>
 
 #include "file.h"
+#include "../handle/handle.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
@@ -59,6 +57,24 @@
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #endif
 
+/* one handle per standard stream (stdin, stdout, stderr), created on first use */
+static WINPR_FILE* pStdHandleFiles[3] = WINPR_C_ARRAY_INIT;
+
+WINPR_PRAGMA_DIAG_PUSH
+WINPR_PRAGMA_DIAG("-Wglobal-constructors")
+static void GetStdHandle_Uninit(void) __attribute__((destructor));
+WINPR_PRAGMA_DIAG_POP
+
+static BOOL FileIsStdHandle(HANDLE handle)
+{
+	for (size_t x = 0; x < ARRAYSIZE(pStdHandleFiles); x++)
+	{
+		if (handle == pStdHandleFiles[x])
+			return TRUE;
+	}
+	return FALSE;
+}
+
 static BOOL FileIsHandled(HANDLE handle)
 {
 	return WINPR_HANDLE_IS_HANDLED(handle, HANDLE_TYPE_FILE, FALSE);
@@ -74,55 +90,92 @@ static int FileGetFd(HANDLE handle)
 	return fileno(file->fp);
 }
 
-static BOOL FileCloseHandle(HANDLE handle)
+static BOOL FileCloseHandleInt(HANDLE handle, BOOL force)
 {
 	WINPR_FILE* file = (WINPR_FILE*)handle;
 
 	if (!FileIsHandled(handle))
 		return FALSE;
 
+	if (!force)
+	{
+		if (FileIsStdHandle(handle))
+		{
+			return FALSE;
+		}
+	}
+
 	if (file->fp)
 	{
 		/* Don't close stdin/stdout/stderr */
 		if (fileno(file->fp) > 2)
 		{
-			fclose(file->fp);
-			file->fp = NULL;
+			(void)fclose(file->fp);
+			file->fp = nullptr;
 		}
 	}
 
 	free(file->lpFileName);
-	free(file);
+	file->lpFileName = nullptr;
 	return TRUE;
+}
+
+static BOOL FileCloseHandle(HANDLE handle)
+{
+	return FileCloseHandleInt(handle, FALSE);
+}
+
+#define log_error(fkt, file) log_error_((fkt), (file), __FILE__, __func__, __LINE__)
+static BOOL log_error_(const char* name, const WINPR_FILE* pFile, const char* file, const char* fkt,
+                       size_t line)
+{
+	char ebuffer[256] = WINPR_C_ARRAY_INIT;
+
+	WINPR_ASSERT(name);
+	WINPR_ASSERT(pFile);
+	WINPR_ASSERT(file);
+	WINPR_ASSERT(fkt);
+
+	const DWORD level = WLOG_ERROR;
+	static wLog* log = nullptr;
+	if (!log)
+		log = WLog_Get(TAG);
+
+	if (WLog_IsLevelActive(log, level))
+	{
+		WLog_PrintTextMessage(log, level, line, file, fkt, "%s %s failed with %s [0x%08x]", name,
+		                      pFile->lpFileName, winpr_strerror(errno, ebuffer, sizeof(ebuffer)),
+		                      WINPR_CXX_COMPAT_CAST(unsigned, errno));
+	}
+	SetLastError(map_posix_err(errno));
+	return FALSE;
 }
 
 static BOOL FileSetEndOfFile(HANDLE hFile)
 {
 	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
-	INT64 size;
 
 	if (!hFile)
 		return FALSE;
 
-	size = _ftelli64(pFile->fp);
-
-	if (ftruncate(fileno(pFile->fp), size) < 0)
-	{
-		WLog_ERR(TAG, "ftruncate %s failed with %s [0x%08X]", pFile->lpFileName, strerror(errno),
-		         errno);
-		SetLastError(map_posix_err(errno));
+	const INT64 size = _ftelli64(pFile->fp);
+	if (size < 0)
 		return FALSE;
-	}
+
+	if (ftruncate(fileno(pFile->fp), (off_t)size) < 0)
+		return log_error("ftruncate", pFile);
 
 	return TRUE;
 }
 
-static DWORD FileSetFilePointer(HANDLE hFile, LONG lDistanceToMove, PLONG lpDistanceToMoveHigh,
-                                DWORD dwMoveMethod)
+// NOLINTBEGIN(readability-non-const-parameter)
+static DWORD FileSetFilePointer(HANDLE hFile, LONG lDistanceToMove,
+                                const PLONG lpDistanceToMoveHigh, DWORD dwMoveMethod)
+// NOLINTEND(readability-non-const-parameter)
 {
 	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
-	INT64 offset;
-	int whence;
+	INT64 offset = 0;
+	int whence = 0;
 
 	if (!hFile)
 		return INVALID_SET_FILE_POINTER;
@@ -153,8 +206,7 @@ static DWORD FileSetFilePointer(HANDLE hFile, LONG lDistanceToMove, PLONG lpDist
 
 	if (_fseeki64(pFile->fp, offset, whence))
 	{
-		WLog_ERR(TAG, "_fseeki64(%s) failed with %s [0x%08X]", pFile->lpFileName, strerror(errno),
-		         errno);
+		(void)log_error("_fseeki64", pFile);
 		return INVALID_SET_FILE_POINTER;
 	}
 
@@ -165,7 +217,7 @@ static BOOL FileSetFilePointerEx(HANDLE hFile, LARGE_INTEGER liDistanceToMove,
                                  PLARGE_INTEGER lpNewFilePointer, DWORD dwMoveMethod)
 {
 	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
-	int whence;
+	int whence = 0;
 
 	if (!hFile)
 		return FALSE;
@@ -186,11 +238,7 @@ static BOOL FileSetFilePointerEx(HANDLE hFile, LARGE_INTEGER liDistanceToMove,
 	}
 
 	if (_fseeki64(pFile->fp, liDistanceToMove.QuadPart, whence))
-	{
-		WLog_ERR(TAG, "_fseeki64(%s) failed with %s [0x%08X]", pFile->lpFileName, strerror(errno),
-		         errno);
-		return FALSE;
-	}
+		return log_error("_fseeki64", pFile);
 
 	if (lpNewFilePointer)
 		lpNewFilePointer->QuadPart = _ftelli64(pFile->fp);
@@ -201,13 +249,13 @@ static BOOL FileSetFilePointerEx(HANDLE hFile, LARGE_INTEGER liDistanceToMove,
 static BOOL FileRead(PVOID Object, LPVOID lpBuffer, DWORD nNumberOfBytesToRead,
                      LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped)
 {
-	size_t io_status;
-	WINPR_FILE* file;
+	size_t io_status = 0;
+	WINPR_FILE* file = nullptr;
 	BOOL status = TRUE;
 
 	if (lpOverlapped)
 	{
-		WLog_ERR(TAG, "WinPR %s does not support the lpOverlapped parameter", __FUNCTION__);
+		WLog_ERR(TAG, "WinPR does not support the lpOverlapped parameter");
 		SetLastError(ERROR_NOT_SUPPORTED);
 		return FALSE;
 	}
@@ -242,12 +290,12 @@ static BOOL FileRead(PVOID Object, LPVOID lpBuffer, DWORD nNumberOfBytesToRead,
 static BOOL FileWrite(PVOID Object, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite,
                       LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
 {
-	size_t io_status;
-	WINPR_FILE* file;
+	size_t io_status = 0;
+	WINPR_FILE* file = nullptr;
 
 	if (lpOverlapped)
 	{
-		WLog_ERR(TAG, "WinPR %s does not support the lpOverlapped parameter", __FUNCTION__);
+		WLog_ERR(TAG, "WinPR does not support the lpOverlapped parameter");
 		SetLastError(ERROR_NOT_SUPPORTED);
 		return FALSE;
 	}
@@ -271,8 +319,9 @@ static BOOL FileWrite(PVOID Object, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrit
 
 static DWORD FileGetFileSize(HANDLE Object, LPDWORD lpFileSizeHigh)
 {
-	WINPR_FILE* file;
-	INT64 cur, size;
+	WINPR_FILE* file = nullptr;
+	INT64 cur = 0;
+	INT64 size = 0;
 
 	if (!Object)
 		return 0;
@@ -283,15 +332,13 @@ static DWORD FileGetFileSize(HANDLE Object, LPDWORD lpFileSizeHigh)
 
 	if (cur < 0)
 	{
-		WLog_ERR(TAG, "_ftelli64(%s) failed with %s [0x%08X]", file->lpFileName, strerror(errno),
-		         errno);
+		(void)log_error("_ftelli64", file);
 		return INVALID_FILE_SIZE;
 	}
 
 	if (_fseeki64(file->fp, 0, SEEK_END) != 0)
 	{
-		WLog_ERR(TAG, "_fseeki64(%s) failed with %s [0x%08X]", file->lpFileName, strerror(errno),
-		         errno);
+		(void)log_error("_fseeki64", file);
 		return INVALID_FILE_SIZE;
 	}
 
@@ -299,15 +346,13 @@ static DWORD FileGetFileSize(HANDLE Object, LPDWORD lpFileSizeHigh)
 
 	if (size < 0)
 	{
-		WLog_ERR(TAG, "_ftelli64(%s) failed with %s [0x%08X]", file->lpFileName, strerror(errno),
-		         errno);
+		(void)log_error("_ftelli64", file);
 		return INVALID_FILE_SIZE;
 	}
 
 	if (_fseeki64(file->fp, cur, SEEK_SET) != 0)
 	{
-		WLog_ERR(TAG, "_ftelli64(%s) failed with %s [0x%08X]", file->lpFileName, strerror(errno),
-		         errno);
+		(void)log_error("_fseeki64", file);
 		return INVALID_FILE_SIZE;
 	}
 
@@ -317,13 +362,39 @@ static DWORD FileGetFileSize(HANDLE Object, LPDWORD lpFileSizeHigh)
 	return (UINT32)(size & 0xFFFFFFFF);
 }
 
+static BOOL FileFlushFileBuffers(HANDLE hFile)
+{
+	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
+
+	if (!pFile->fp)
+	{
+		SetLastError(ERROR_INVALID_HANDLE);
+		return FALSE;
+	}
+
+	// See: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers
+	if ((pFile->dwOpenMode & GENERIC_WRITE) == 0)
+	{
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+
+	if (fflush(pFile->fp) != 0)
+	{
+		SetLastError(map_posix_err(errno));
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
 static BOOL FileGetFileInformationByHandle(HANDLE hFile,
                                            LPBY_HANDLE_FILE_INFORMATION lpFileInformation)
 {
 	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
 	struct stat st;
-	UINT64 ft;
-	const char* lastSep;
+	UINT64 ft = 0;
+	const char* lastSep = nullptr;
 
 	if (!pFile)
 		return FALSE;
@@ -331,10 +402,7 @@ static BOOL FileGetFileInformationByHandle(HANDLE hFile,
 		return FALSE;
 
 	if (fstat(fileno(pFile->fp), &st) == -1)
-	{
-		WLog_ERR(TAG, "fstat failed with %s [%#08X]", errno, strerror(errno));
-		return FALSE;
-	}
+		return log_error("fstat", pFile);
 
 	lpFileInformation->dwFileAttributes = 0;
 
@@ -363,38 +431,39 @@ static BOOL FileGetFileInformationByHandle(HANDLE hFile,
 #else
 	ft = STAT_TIME_TO_FILETIME(st.st_ctime);
 #endif
-	lpFileInformation->ftCreationTime.dwHighDateTime = ((UINT64)ft) >> 32ULL;
+	lpFileInformation->ftCreationTime.dwHighDateTime = (ft) >> 32ULL;
 	lpFileInformation->ftCreationTime.dwLowDateTime = ft & 0xFFFFFFFF;
 	ft = STAT_TIME_TO_FILETIME(st.st_mtime);
-	lpFileInformation->ftLastWriteTime.dwHighDateTime = ((UINT64)ft) >> 32ULL;
+	lpFileInformation->ftLastWriteTime.dwHighDateTime = (ft) >> 32ULL;
 	lpFileInformation->ftLastWriteTime.dwLowDateTime = ft & 0xFFFFFFFF;
 	ft = STAT_TIME_TO_FILETIME(st.st_atime);
-	lpFileInformation->ftLastAccessTime.dwHighDateTime = ((UINT64)ft) >> 32ULL;
+	lpFileInformation->ftLastAccessTime.dwHighDateTime = (ft) >> 32ULL;
 	lpFileInformation->ftLastAccessTime.dwLowDateTime = ft & 0xFFFFFFFF;
 	lpFileInformation->nFileSizeHigh = ((UINT64)st.st_size) >> 32ULL;
 	lpFileInformation->nFileSizeLow = st.st_size & 0xFFFFFFFF;
-	lpFileInformation->dwVolumeSerialNumber = st.st_dev;
-	lpFileInformation->nNumberOfLinks = st.st_nlink;
+	lpFileInformation->dwVolumeSerialNumber = (UINT32)st.st_dev;
+	lpFileInformation->nNumberOfLinks = (UINT32)st.st_nlink;
 	lpFileInformation->nFileIndexHigh = (st.st_ino >> 4) & 0xFFFFFFFF;
 	lpFileInformation->nFileIndexLow = st.st_ino & 0xFFFFFFFF;
 	return TRUE;
 }
 
-static BOOL FileLockFileEx(HANDLE hFile, DWORD dwFlags, DWORD dwReserved,
-                           DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh,
+static BOOL FileLockFileEx(HANDLE hFile, DWORD dwFlags, WINPR_ATTR_UNUSED DWORD dwReserved,
+                           WINPR_ATTR_UNUSED DWORD nNumberOfBytesToLockLow,
+                           WINPR_ATTR_UNUSED DWORD nNumberOfBytesToLockHigh,
                            LPOVERLAPPED lpOverlapped)
 {
 #ifdef __sun
 	struct flock lock;
 	int lckcmd;
 #else
-	int lock;
+	int lock = 0;
 #endif
 	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
 
 	if (lpOverlapped)
 	{
-		WLog_ERR(TAG, "WinPR %s does not support the lpOverlapped parameter", __FUNCTION__);
+		WLog_ERR(TAG, "WinPR does not support the lpOverlapped parameter");
 		SetLastError(ERROR_NOT_SUPPORTED);
 		return FALSE;
 	}
@@ -425,7 +494,10 @@ static BOOL FileLockFileEx(HANDLE hFile, DWORD dwFlags, DWORD dwReserved,
 
 	if (fcntl(fileno(pFile->fp), lckcmd, &lock) == -1)
 	{
-		WLog_ERR(TAG, "F_SETLK failed with %s [0x%08X]", strerror(errno), errno);
+		char ebuffer[256] = WINPR_C_ARRAY_INIT;
+		WLog_ERR(TAG, "F_SETLK failed with %s [0x%08X]",
+		         winpr_strerror(errno, ebuffer, sizeof(ebuffer)), errno);
+		SetLastError(map_posix_err(errno));
 		return FALSE;
 	}
 #else
@@ -438,10 +510,7 @@ static BOOL FileLockFileEx(HANDLE hFile, DWORD dwFlags, DWORD dwReserved,
 		lock |= LOCK_NB;
 
 	if (flock(fileno(pFile->fp), lock) < 0)
-	{
-		WLog_ERR(TAG, "flock failed with %s [0x%08X]", strerror(errno), errno);
-		return FALSE;
-	}
+		return log_error("flock", pFile);
 #endif
 
 	pFile->bLocked = TRUE;
@@ -449,8 +518,10 @@ static BOOL FileLockFileEx(HANDLE hFile, DWORD dwFlags, DWORD dwReserved,
 	return TRUE;
 }
 
-static BOOL FileUnlockFile(HANDLE hFile, DWORD dwFileOffsetLow, DWORD dwFileOffsetHigh,
-                           DWORD nNumberOfBytesToUnlockLow, DWORD nNumberOfBytesToUnlockHigh)
+static BOOL FileUnlockFile(HANDLE hFile, WINPR_ATTR_UNUSED DWORD dwFileOffsetLow,
+                           WINPR_ATTR_UNUSED DWORD dwFileOffsetHigh,
+                           WINPR_ATTR_UNUSED DWORD nNumberOfBytesToUnlockLow,
+                           WINPR_ATTR_UNUSED DWORD nNumberOfBytesToUnlockHigh)
 {
 	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
 #ifdef __sun
@@ -472,26 +543,20 @@ static BOOL FileUnlockFile(HANDLE hFile, DWORD dwFileOffsetLow, DWORD dwFileOffs
 	lock.l_whence = SEEK_SET;
 	lock.l_type = F_UNLCK;
 	if (fcntl(fileno(pFile->fp), F_GETLK, &lock) == -1)
-	{
-		WLog_ERR(TAG, "F_UNLCK on %s failed with %s [0x%08X]", pFile->lpFileName, strerror(errno),
-		         errno);
-		return FALSE;
-	}
+		return log_error("F_GETLK", pFile);
 
 #else
 	if (flock(fileno(pFile->fp), LOCK_UN) < 0)
-	{
-		WLog_ERR(TAG, "flock(LOCK_UN) %s failed with %s [0x%08X]", pFile->lpFileName,
-		         strerror(errno), errno);
-		return FALSE;
-	}
+		return log_error("flock", pFile);
 #endif
 
 	return TRUE;
 }
 
-static BOOL FileUnlockFileEx(HANDLE hFile, DWORD dwReserved, DWORD nNumberOfBytesToUnlockLow,
-                             DWORD nNumberOfBytesToUnlockHigh, LPOVERLAPPED lpOverlapped)
+static BOOL FileUnlockFileEx(HANDLE hFile, WINPR_ATTR_UNUSED DWORD dwReserved,
+                             WINPR_ATTR_UNUSED DWORD nNumberOfBytesToUnlockLow,
+                             WINPR_ATTR_UNUSED DWORD nNumberOfBytesToUnlockHigh,
+                             LPOVERLAPPED lpOverlapped)
 {
 	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
 #ifdef __sun
@@ -500,7 +565,7 @@ static BOOL FileUnlockFileEx(HANDLE hFile, DWORD dwReserved, DWORD nNumberOfByte
 
 	if (lpOverlapped)
 	{
-		WLog_ERR(TAG, "WinPR %s does not support the lpOverlapped parameter", __FUNCTION__);
+		WLog_ERR(TAG, "WinPR does not support the lpOverlapped parameter");
 		SetLastError(ERROR_NOT_SUPPORTED);
 		return FALSE;
 	}
@@ -520,144 +585,168 @@ static BOOL FileUnlockFileEx(HANDLE hFile, DWORD dwReserved, DWORD nNumberOfByte
 	lock.l_whence = SEEK_SET;
 	lock.l_type = F_UNLCK;
 	if (fcntl(fileno(pFile->fp), F_GETLK, &lock) == -1)
-	{
-		WLog_ERR(TAG, "F_UNLCK on %s failed with %s [0x%08X]", pFile->lpFileName, strerror(errno),
-		         errno);
-		return FALSE;
-	}
+		return log_error("F_GETLK", pFile);
 #else
 	if (flock(fileno(pFile->fp), LOCK_UN) < 0)
-	{
-		WLog_ERR(TAG, "flock(LOCK_UN) %s failed with %s [0x%08X]", pFile->lpFileName,
-		         strerror(errno), errno);
-		return FALSE;
-	}
+		return log_error("flock", pFile);
 #endif
 
 	return TRUE;
 }
 
-static UINT64 FileTimeToUS(const FILETIME* ft)
+static INT64 FileTimeToUS(const FILETIME* ft)
 {
-	const UINT64 EPOCH_DIFF_US = EPOCH_DIFF * 1000000ULL;
-	UINT64 tmp = ((UINT64)ft->dwHighDateTime) << 32 | ft->dwLowDateTime;
+	const INT64 EPOCH_DIFF_US = EPOCH_DIFF * 1000000LL;
+	INT64 tmp = ((INT64)ft->dwHighDateTime) << 32 | ft->dwLowDateTime;
 	tmp /= 10; /* 100ns steps to 1us step */
 	tmp -= EPOCH_DIFF_US;
 	return tmp;
 }
 
-static BOOL FileSetFileTime(HANDLE hFile, const FILETIME* lpCreationTime,
+#if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200809L)
+static struct timespec filetimeToTimespec(const FILETIME* ftime)
+{
+	WINPR_ASSERT(ftime);
+	INT64 tmp = FileTimeToUS(ftime);
+	struct timespec ts = WINPR_C_ARRAY_INIT;
+	ts.tv_sec = tmp / 1000000LL;
+	ts.tv_nsec = (tmp % 1000000LL) * 1000LL;
+	return ts;
+}
+
+static BOOL FileSetFileTime(HANDLE hFile, WINPR_ATTR_UNUSED const FILETIME* lpCreationTime,
                             const FILETIME* lpLastAccessTime, const FILETIME* lpLastWriteTime)
 {
-	int rc;
-#if defined(__APPLE__) || defined(ANDROID) || defined(__FreeBSD__) || defined(KFREEBSD)
-	struct stat buf;
-	/* OpenBSD, NetBSD and DragonflyBSD support POSIX futimens */
-	struct timeval timevals[2];
-#else
-	struct timespec times[2]; /* last access, last modification */
-#endif
+	struct timespec times[2] = { { UTIME_OMIT, UTIME_OMIT },
+		                         { UTIME_OMIT, UTIME_OMIT } }; /* last access, last modification */
 	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
 
 	if (!hFile)
 		return FALSE;
 
-#if defined(__APPLE__) || defined(ANDROID) || defined(__FreeBSD__) || defined(KFREEBSD)
-	rc = fstat(fileno(pFile->fp), &buf);
+	if (lpLastAccessTime)
+		times[0] = filetimeToTimespec(lpLastAccessTime);
 
-	if (rc < 0)
-		return FALSE;
-
-#endif
-
-	if (!lpLastAccessTime)
-	{
-#if defined(__FreeBSD__) || defined(__APPLE__) || defined(KFREEBSD)
-		timevals[0].tv_sec = buf.st_atime;
-#ifdef _POSIX_SOURCE
-		TIMESPEC_TO_TIMEVAL(&timevals[0], &buf.st_atim);
-#else
-		TIMESPEC_TO_TIMEVAL(&timevals[0], &buf.st_atimespec);
-#endif
-#elif defined(ANDROID)
-		timevals[0].tv_sec = buf.st_atime;
-		timevals[0].tv_usec = buf.st_atimensec / 1000UL;
-#else
-		times[0].tv_sec = UTIME_OMIT;
-		times[0].tv_nsec = UTIME_OMIT;
-#endif
-	}
-	else
-	{
-		UINT64 tmp = FileTimeToUS(lpLastAccessTime);
-#if defined(ANDROID) || defined(__FreeBSD__) || defined(__APPLE__) || defined(KFREEBSD)
-		timevals[0].tv_sec = tmp / 1000000ULL;
-		timevals[0].tv_usec = tmp % 1000000ULL;
-#else
-		times[0].tv_sec = tmp / 1000000ULL;
-		times[0].tv_nsec = (tmp % 1000000ULL) * 1000ULL;
-#endif
-	}
-
-	if (!lpLastWriteTime)
-	{
-#if defined(__FreeBSD__) || defined(__APPLE__) || defined(KFREEBSD)
-		timevals[1].tv_sec = buf.st_mtime;
-#ifdef _POSIX_SOURCE
-		TIMESPEC_TO_TIMEVAL(&timevals[1], &buf.st_mtim);
-#else
-		TIMESPEC_TO_TIMEVAL(&timevals[1], &buf.st_mtimespec);
-#endif
-#elif defined(ANDROID)
-		timevals[1].tv_sec = buf.st_mtime;
-		timevals[1].tv_usec = buf.st_mtimensec / 1000UL;
-#else
-		times[1].tv_sec = UTIME_OMIT;
-		times[1].tv_nsec = UTIME_OMIT;
-#endif
-	}
-	else
-	{
-		UINT64 tmp = FileTimeToUS(lpLastWriteTime);
-#if defined(ANDROID) || defined(__FreeBSD__) || defined(__APPLE__) || defined(KFREEBSD)
-		timevals[1].tv_sec = tmp / 1000000ULL;
-		timevals[1].tv_usec = tmp % 1000000ULL;
-#else
-		times[1].tv_sec = tmp / 1000000ULL;
-		times[1].tv_nsec = (tmp % 1000000ULL) * 1000ULL;
-#endif
-	}
+	if (lpLastWriteTime)
+		times[1] = filetimeToTimespec(lpLastWriteTime);
 
 	// TODO: Creation time can not be handled!
-#if defined(ANDROID) || defined(__FreeBSD__) || defined(__APPLE__) || defined(KFREEBSD)
-	rc = utimes(pFile->lpFileName, timevals);
-#else
-	rc = futimens(fileno(pFile->fp), times);
-#endif
-
+	const int rc = futimens(fileno(pFile->fp), times);
 	if (rc != 0)
+	{
+		char ebuffer[256] = WINPR_C_ARRAY_INIT;
+		WLog_ERR(TAG, "futimens failed: %s [%d]", winpr_strerror(errno, ebuffer, sizeof(ebuffer)),
+		         errno);
+		SetLastError(map_posix_err(errno));
 		return FALSE;
+	}
 
 	return TRUE;
 }
+#elif defined(__APPLE__) || defined(ANDROID) || defined(__FreeBSD__) || defined(KFREEBSD)
+static struct timeval filetimeToTimeval(const FILETIME* ftime)
+{
+	WINPR_ASSERT(ftime);
+	UINT64 tmp = FileTimeToUS(ftime);
+	struct timeval tv = WINPR_C_ARRAY_INIT;
+	tv.tv_sec = tmp / 1000000ULL;
+	tv.tv_usec = tmp % 1000000ULL;
+	return tv;
+}
+
+static struct timeval statToTimeval(const struct stat* sval, BOOL modification)
+{
+	WINPR_ASSERT(sval);
+	struct timeval tv = WINPR_C_ARRAY_INIT;
+#if defined(__FreeBSD__) || defined(__APPLE__) || defined(KFREEBSD)
+#ifdef _POSIX_SOURCE
+	TIMESPEC_TO_TIMEVAL(&tv, modification ? &sval->st_mtim : &sval->st_atim);
+#else
+	TIMESPEC_TO_TIMEVAL(&tv, modification ? &sval->st_mtimespec : &sval->st_atimespec);
+#endif
+#elif defined(ANDROID)
+	tv.tv_sec = modification ? sval->st_mtime : sval->st_atime;
+	tv.tv_usec = (modification ? sval->st_mtimensec : sval->st_atimensec) / 1000UL;
+#endif
+	return tv;
+}
+
+static BOOL FileSetFileTime(HANDLE hFile, const FILETIME* lpCreationTime,
+                            const FILETIME* lpLastAccessTime, const FILETIME* lpLastWriteTime)
+{
+	struct stat buf = WINPR_C_ARRAY_INIT;
+	/* OpenBSD, NetBSD and DragonflyBSD support POSIX futimens */
+	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
+
+	if (!hFile)
+		return FALSE;
+
+	const int rc = fstat(fileno(pFile->fp), &buf);
+	if (rc < 0)
+	{
+		char ebuffer[256] = WINPR_C_ARRAY_INIT;
+		WLog_ERR(TAG, "fstat failed: %s [%d]", winpr_strerror(errno, ebuffer, sizeof(ebuffer)),
+		         errno);
+		SetLastError(map_posix_err(errno));
+		return FALSE;
+	}
+
+	/* Keep the times that are not set */
+	struct timeval timevals[2] = { statToTimeval(&buf, FALSE), statToTimeval(&buf, TRUE) };
+	if (lpLastAccessTime)
+		timevals[0] = filetimeToTimeval(lpLastAccessTime);
+
+	if (lpLastWriteTime)
+		timevals[1] = filetimeToTimeval(lpLastWriteTime);
+
+	// TODO: Creation time can not be handled!
+	{
+		const int res = utimes(pFile->lpFileName, timevals);
+		if (res != 0)
+		{
+			char ebuffer[256] = WINPR_C_ARRAY_INIT;
+			WLog_ERR(TAG, "utimes failed: %s [%d]", winpr_strerror(errno, ebuffer, sizeof(ebuffer)),
+			         errno);
+			SetLastError(map_posix_err(errno));
+			return FALSE;
+		}
+	}
+
+	return TRUE;
+}
+#else
+static BOOL FileSetFileTime(HANDLE hFile, const FILETIME* lpCreationTime,
+                            const FILETIME* lpLastAccessTime, const FILETIME* lpLastWriteTime)
+{
+	WINPR_FILE* pFile = (WINPR_FILE*)hFile;
+
+	if (!hFile)
+		return FALSE;
+
+	WLog_WARN(TAG, "TODO: Creation, Access and Write time can not be handled!");
+	WLog_WARN(TAG,
+	          "TODO: Define _POSIX_C_SOURCE >= 200809L or implement a platform specific handler!");
+	return TRUE;
+}
+#endif
 
 static HANDLE_OPS fileOps = {
 	FileIsHandled,
 	FileCloseHandle,
 	FileGetFd,
-	NULL, /* CleanupHandle */
+	nullptr, /* CleanupHandle */
 	FileRead,
-	NULL, /* FileReadEx */
-	NULL, /* FileReadScatter */
+	nullptr, /* FileReadEx */
+	nullptr, /* FileReadScatter */
 	FileWrite,
-	NULL, /* FileWriteEx */
-	NULL, /* FileWriteGather */
+	nullptr, /* FileWriteEx */
+	nullptr, /* FileWriteGather */
 	FileGetFileSize,
-	NULL, /*  FlushFileBuffers */
+	FileFlushFileBuffers,
 	FileSetEndOfFile,
 	FileSetFilePointer,
 	FileSetFilePointerEx,
-	NULL, /* FileLockFile */
+	nullptr, /* FileLockFile */
 	FileLockFileEx,
 	FileUnlockFile,
 	FileUnlockFileEx,
@@ -669,23 +758,23 @@ static HANDLE_OPS shmOps = {
 	FileIsHandled,
 	FileCloseHandle,
 	FileGetFd,
-	NULL, /* CleanupHandle */
+	nullptr, /* CleanupHandle */
 	FileRead,
-	NULL, /* FileReadEx */
-	NULL, /* FileReadScatter */
+	nullptr, /* FileReadEx */
+	nullptr, /* FileReadScatter */
 	FileWrite,
-	NULL, /* FileWriteEx */
-	NULL, /* FileWriteGather */
-	NULL, /* FileGetFileSize */
-	NULL, /*  FlushFileBuffers */
-	NULL, /* FileSetEndOfFile */
-	NULL, /* FileSetFilePointer */
-	NULL, /* SetFilePointerEx */
-	NULL, /* FileLockFile */
-	NULL, /* FileLockFileEx */
-	NULL, /* FileUnlockFile */
-	NULL, /* FileUnlockFileEx */
-	NULL, /* FileSetFileTime */
+	nullptr, /* FileWriteEx */
+	nullptr, /* FileWriteGather */
+	nullptr, /* FileGetFileSize */
+	nullptr, /*  FlushFileBuffers */
+	nullptr, /* FileSetEndOfFile */
+	nullptr, /* FileSetFilePointer */
+	nullptr, /* SetFilePointerEx */
+	nullptr, /* FileLockFile */
+	nullptr, /* FileLockFileEx */
+	nullptr, /* FileUnlockFile */
+	nullptr, /* FileUnlockFileEx */
+	nullptr, /* FileSetFileTime */
 	FileGetFileInformationByHandle,
 };
 
@@ -718,7 +807,7 @@ static const char* FileGetMode(DWORD dwDesiredAccess, DWORD dwCreationDispositio
 
 UINT32 map_posix_err(int fs_errno)
 {
-	NTSTATUS rc;
+	NTSTATUS rc = 0;
 
 	/* try to return NTSTATUS version of error code */
 
@@ -761,10 +850,18 @@ UINT32 map_posix_err(int fs_errno)
 			rc = STATUS_DIRECTORY_NOT_EMPTY;
 			break;
 
-		default:
-			WLog_ERR(TAG, "Missing ERRNO mapping %s [%d]", strerror(fs_errno), fs_errno);
-			rc = STATUS_UNSUCCESSFUL;
+		case EMFILE:
+			rc = STATUS_TOO_MANY_OPENED_FILES;
 			break;
+
+		default:
+		{
+			char ebuffer[256] = WINPR_C_ARRAY_INIT;
+			WLog_ERR(TAG, "Missing ERRNO mapping %s [%d]",
+			         winpr_strerror(fs_errno, ebuffer, sizeof(ebuffer)), fs_errno);
+			rc = STATUS_UNSUCCESSFUL;
+		}
+		break;
 	}
 
 	return (UINT32)rc;
@@ -775,20 +872,20 @@ static HANDLE FileCreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dw
                               DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
                               HANDLE hTemplateFile)
 {
-	WINPR_FILE* pFile;
-	BOOL create;
+	WINPR_FILE* pFile = nullptr;
+	BOOL create = 0;
 	const char* mode = FileGetMode(dwDesiredAccess, dwCreationDisposition, &create);
 #ifdef __sun
 	struct flock lock;
 #else
 	int lock = 0;
 #endif
-	FILE* fp = NULL;
+	FILE* fp = nullptr;
 	struct stat st;
 
 	if (dwFlagsAndAttributes & FILE_FLAG_OVERLAPPED)
 	{
-		WLog_ERR(TAG, "WinPR %s does not support the FILE_FLAG_OVERLAPPED flag", __FUNCTION__);
+		WLog_ERR(TAG, "WinPR does not support the FILE_FLAG_OVERLAPPED flag");
 		SetLastError(ERROR_NOT_SUPPORTED);
 		return INVALID_HANDLE_VALUE;
 	}
@@ -864,7 +961,7 @@ static HANDLE FileCreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dw
 		}
 	}
 
-	if (NULL == fp)
+	if (nullptr == fp)
 		fp = winpr_fopen(pFile->lpFileName, mode);
 
 	pFile->fp = fp;
@@ -878,7 +975,21 @@ static HANDLE FileCreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dw
 		return INVALID_HANDLE_VALUE;
 	}
 
-	setvbuf(fp, NULL, _IONBF, 0);
+	{
+		/* winpr_fopen()/freopen() give no way to request O_CLOEXEC atomically; match Windows
+		 * semantics (not inherited unless asked) by default here too. */
+		const BOOL inherit =
+		    pFile->lpSecurityAttributes && pFile->lpSecurityAttributes->bInheritHandle;
+		if (!winpr_set_cloexec(fileno(fp), !inherit))
+		{
+			SetLastError(map_posix_err(errno));
+			FileCloseHandle(pFile);
+			free(pFile);
+			return INVALID_HANDLE_VALUE;
+		}
+	}
+
+	(void)setvbuf(fp, nullptr, _IONBF, 0);
 
 #ifdef __sun
 	lock.l_start = 0;
@@ -905,13 +1016,14 @@ static HANDLE FileCreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dw
 #endif
 		{
 #ifdef __sun
-			WLog_ERR(TAG, "F_SETLKW failed with %s [0x%08X]", strerror(errno), errno);
+			(void)log_error("F_SETLKW", pFile);
 #else
-			WLog_ERR(TAG, "flock failed with %s [0x%08X]", strerror(errno), errno);
+			(void)log_error("flock", pFile);
 #endif
 
 			SetLastError(map_posix_err(errno));
 			FileCloseHandle(pFile);
+			free(pFile);
 			return INVALID_HANDLE_VALUE;
 		}
 
@@ -920,37 +1032,43 @@ static HANDLE FileCreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dw
 
 	if (fstat(fileno(pFile->fp), &st) == 0 && dwFlagsAndAttributes & FILE_ATTRIBUTE_READONLY)
 	{
-		st.st_mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
-		fchmod(fileno(pFile->fp), st.st_mode);
+		st.st_mode &= WINPR_ASSERTING_INT_CAST(mode_t, (mode_t)(~(S_IWUSR | S_IWGRP | S_IWOTH)));
+		if (fchmod(fileno(pFile->fp), st.st_mode) != 0)
+		{
+			SetLastError(map_posix_err(errno));
+			FileCloseHandle(pFile);
+			free(pFile);
+			return INVALID_HANDLE_VALUE;
+		}
 	}
 
 	SetLastError(STATUS_SUCCESS);
 	return pFile;
 }
 
-static BOOL IsFileDevice(LPCTSTR lpDeviceName)
+static BOOL IsFileDevice(WINPR_ATTR_UNUSED LPCTSTR lpDeviceName)
 {
 	return TRUE;
 }
 
-static HANDLE_CREATOR _FileHandleCreator = { IsFileDevice, FileCreateFileA };
+static const HANDLE_CREATOR FileHandleCreator = { IsFileDevice, FileCreateFileA };
 
-HANDLE_CREATOR* GetFileHandleCreator(void)
+const HANDLE_CREATOR* GetFileHandleCreator(void)
 {
-	return &_FileHandleCreator;
+	return &FileHandleCreator;
 }
 
 static WINPR_FILE* FileHandle_New(FILE* fp)
 {
-	WINPR_FILE* pFile;
-	char name[MAX_PATH] = { 0 };
+	WINPR_FILE* pFile = nullptr;
+	char name[MAX_PATH] = WINPR_C_ARRAY_INIT;
 
-	_snprintf(name, sizeof(name), "device_%d", fileno(fp));
+	(void)_snprintf(name, sizeof(name), "device_%d", fileno(fp));
 	pFile = (WINPR_FILE*)calloc(1, sizeof(WINPR_FILE));
 	if (!pFile)
 	{
 		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-		return NULL;
+		return nullptr;
 	}
 	pFile->fp = fp;
 	pFile->common.ops = &shmOps;
@@ -960,38 +1078,55 @@ static WINPR_FILE* FileHandle_New(FILE* fp)
 	return pFile;
 }
 
+void GetStdHandle_Uninit(void)
+{
+	for (size_t x = 0; x < ARRAYSIZE(pStdHandleFiles); x++)
+	{
+		(void)FileCloseHandleInt(pStdHandleFiles[x], TRUE);
+		free(pStdHandleFiles[x]);
+		pStdHandleFiles[x] = nullptr;
+	}
+}
+
 HANDLE GetStdHandle(DWORD nStdHandle)
 {
-	FILE* fp;
-	WINPR_FILE* pFile;
+	size_t idx = 0;
+	FILE* fp = nullptr;
 
 	switch (nStdHandle)
 	{
 		case STD_INPUT_HANDLE:
+			idx = 0;
 			fp = stdin;
 			break;
 		case STD_OUTPUT_HANDLE:
+			idx = 1;
 			fp = stdout;
 			break;
 		case STD_ERROR_HANDLE:
+			idx = 2;
 			fp = stderr;
 			break;
 		default:
 			return INVALID_HANDLE_VALUE;
 	}
-	pFile = FileHandle_New(fp);
-	if (!pFile)
+
+	if (!pStdHandleFiles[idx])
+		pStdHandleFiles[idx] = FileHandle_New(fp);
+
+	if (!pStdHandleFiles[idx])
 		return INVALID_HANDLE_VALUE;
 
-	return (HANDLE)pFile;
+	return (HANDLE)pStdHandleFiles[idx];
 }
 
-BOOL SetStdHandle(DWORD nStdHandle, HANDLE hHandle)
+BOOL SetStdHandle(WINPR_ATTR_UNUSED DWORD nStdHandle, WINPR_ATTR_UNUSED HANDLE hHandle)
 {
 	return FALSE;
 }
 
-BOOL SetStdHandleEx(DWORD dwStdHandle, HANDLE hNewHandle, HANDLE* phOldHandle)
+BOOL SetStdHandleEx(WINPR_ATTR_UNUSED DWORD dwStdHandle, WINPR_ATTR_UNUSED HANDLE hNewHandle,
+                    WINPR_ATTR_UNUSED HANDLE* phOldHandle)
 {
 	return FALSE;
 }
@@ -1005,7 +1140,7 @@ BOOL GetDiskFreeSpaceA(LPCSTR lpRootPathName, LPDWORD lpSectorsPerCluster, LPDWO
 #define STATVFS statvfs
 #endif
 
-	struct STATVFS svfst = { 0 };
+	struct STATVFS svfst = WINPR_C_ARRAY_INIT;
 	STATVFS(lpRootPathName, &svfst);
 	*lpSectorsPerCluster = (UINT32)MIN(svfst.f_frsize, UINT32_MAX);
 	*lpBytesPerSector = 1;
@@ -1014,23 +1149,27 @@ BOOL GetDiskFreeSpaceA(LPCSTR lpRootPathName, LPDWORD lpSectorsPerCluster, LPDWO
 	return TRUE;
 }
 
-BOOL GetDiskFreeSpaceW(LPCWSTR lpwRootPathName, LPDWORD lpSectorsPerCluster,
+BOOL GetDiskFreeSpaceW(LPCWSTR lpRootPathName, LPDWORD lpSectorsPerCluster,
                        LPDWORD lpBytesPerSector, LPDWORD lpNumberOfFreeClusters,
                        LPDWORD lpTotalNumberOfClusters)
 {
-	LPSTR lpRootPathName;
-	BOOL ret;
+	BOOL ret = 0;
+	if (!lpRootPathName)
+		return FALSE;
 
-	if (ConvertFromUnicode(CP_UTF8, 0, lpwRootPathName, -1, &lpRootPathName, 0, NULL, NULL) <= 0)
+	char* rootPathName = ConvertWCharToUtf8Alloc(lpRootPathName, nullptr);
+	if (!rootPathName)
 	{
 		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
 		return FALSE;
 	}
-	ret = GetDiskFreeSpaceA(lpRootPathName, lpSectorsPerCluster, lpBytesPerSector,
+	ret = GetDiskFreeSpaceA(rootPathName, lpSectorsPerCluster, lpBytesPerSector,
 	                        lpNumberOfFreeClusters, lpTotalNumberOfClusters);
-	free(lpRootPathName);
+	free(rootPathName);
 	return ret;
 }
+
+#endif /* _WIN32 */
 
 /**
  * Check if a file name component is valid.
@@ -1040,8 +1179,6 @@ BOOL GetDiskFreeSpaceW(LPCWSTR lpwRootPathName, LPDWORD lpSectorsPerCluster,
  */
 BOOL ValidFileNameComponent(LPCWSTR lpFileName)
 {
-	LPCWSTR c = NULL;
-
 	if (!lpFileName)
 		return FALSE;
 
@@ -1102,7 +1239,7 @@ BOOL ValidFileNameComponent(LPCWSTR lpFileName)
 	}
 
 	/* Reserved characters */
-	for (c = lpFileName; *c; c++)
+	for (LPCWSTR c = lpFileName; *c; c++)
 	{
 		if ((*c == L'<') || (*c == L'>') || (*c == L':') || (*c == L'"') || (*c == L'/') ||
 		    (*c == L'\\') || (*c == L'|') || (*c == L'?') || (*c == L'*'))
@@ -1114,8 +1251,6 @@ BOOL ValidFileNameComponent(LPCWSTR lpFileName)
 	return TRUE;
 }
 
-#endif /* _WIN32 */
-
 #ifdef _UWP
 
 HANDLE CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
@@ -1123,9 +1258,7 @@ HANDLE CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
                    DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
 {
 	HANDLE hFile;
-	CREATEFILE2_EXTENDED_PARAMETERS params;
-
-	ZeroMemory(&params, sizeof(CREATEFILE2_EXTENDED_PARAMETERS));
+	CREATEFILE2_EXTENDED_PARAMETERS params = WINPR_C_ARRAY_INIT;
 
 	params.dwSize = sizeof(CREATEFILE2_EXTENDED_PARAMETERS);
 
@@ -1215,12 +1348,13 @@ HANDLE CreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
                    DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
 {
 	HANDLE hFile;
-	WCHAR* lpFileNameW = NULL;
+	if (!lpFileName)
+		return nullptr;
 
-	ConvertToUnicode(CP_UTF8, 0, lpFileName, -1, &lpFileNameW, 0);
+	WCHAR* lpFileNameW = ConvertUtf8ToWCharAlloc(lpFileName, nullptr);
 
 	if (!lpFileNameW)
-		return NULL;
+		return nullptr;
 
 	hFile = CreateFileW(lpFileNameW, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
 	                    dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
@@ -1271,28 +1405,27 @@ DWORD SetFilePointer(HANDLE hFile, LONG lDistanceToMove, PLONG lpDistanceToMoveH
 HANDLE FindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData)
 {
 	return FindFirstFileExA(lpFileName, FindExInfoStandard, lpFindFileData, FindExSearchNameMatch,
-	                        NULL, 0);
+	                        nullptr, 0);
 }
 
 HANDLE FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData)
 {
 	return FindFirstFileExW(lpFileName, FindExInfoStandard, lpFindFileData, FindExSearchNameMatch,
-	                        NULL, 0);
+	                        nullptr, 0);
 }
 
 DWORD GetFullPathNameA(LPCSTR lpFileName, DWORD nBufferLength, LPSTR lpBuffer, LPSTR* lpFilePart)
 {
 	DWORD dwStatus;
-	WCHAR* lpFileNameW = NULL;
-	WCHAR* lpBufferW = NULL;
-	WCHAR* lpFilePartW = NULL;
-	DWORD nBufferLengthW = nBufferLength * 2;
+	WCHAR* lpFileNameW = nullptr;
+	WCHAR* lpBufferW = nullptr;
+	WCHAR* lpFilePartW = nullptr;
+	DWORD nBufferLengthW = nBufferLength * sizeof(WCHAR);
 
 	if (!lpFileName || (nBufferLength < 1))
 		return 0;
 
-	ConvertToUnicode(CP_UTF8, 0, lpFileName, -1, &lpFileNameW, 0);
-
+	lpFileNameW = ConvertUtf8ToWCharAlloc(lpFileName, nullptr);
 	if (!lpFileNameW)
 		return 0;
 
@@ -1303,7 +1436,7 @@ DWORD GetFullPathNameA(LPCSTR lpFileName, DWORD nBufferLength, LPSTR lpBuffer, L
 
 	dwStatus = GetFullPathNameW(lpFileNameW, nBufferLengthW, lpBufferW, &lpFilePartW);
 
-	ConvertFromUnicode(CP_UTF8, 0, lpBufferW, nBufferLengthW, &lpBuffer, nBufferLength, NULL, NULL);
+	(void)ConvertWCharNToUtf8(lpBufferW, nBufferLengthW / sizeof(WCHAR), lpBuffer, nBufferLength);
 
 	if (lpFilePart)
 		lpFilePart = lpBuffer + (lpFilePartW - lpBufferW);
@@ -1311,7 +1444,7 @@ DWORD GetFullPathNameA(LPCSTR lpFileName, DWORD nBufferLength, LPSTR lpBuffer, L
 	free(lpFileNameW);
 	free(lpBufferW);
 
-	return dwStatus * 2;
+	return WINPR_ASSERTING_INT_CAST(DWORD, dwStatus * sizeof(WCHAR));
 }
 
 BOOL GetDiskFreeSpaceA(LPCSTR lpRootPathName, LPDWORD lpSectorsPerCluster, LPDWORD lpBytesPerSector,
@@ -1394,9 +1527,9 @@ HANDLE GetFileHandleForFileDescriptor(int fd)
 #ifdef _WIN32
 	return (HANDLE)_get_osfhandle(fd);
 #else  /* _WIN32 */
-	WINPR_FILE* pFile;
-	FILE* fp;
-	int flags;
+	WINPR_FILE* pFile = nullptr;
+	FILE* fp = nullptr;
+	int flags = 0;
 
 	/* Make sure it's a valid fd */
 	if (fcntl(fd, F_GETFD) == -1 && errno == EBADF)
@@ -1414,8 +1547,9 @@ HANDLE GetFileHandleForFileDescriptor(int fd)
 	if (!fp)
 		return INVALID_HANDLE_VALUE;
 
-	setvbuf(fp, NULL, _IONBF, 0);
+	(void)setvbuf(fp, nullptr, _IONBF, 0);
 
+	// NOLINTNEXTLINE(clang-analyzer-unix.Stream)
 	pFile = FileHandle_New(fp);
 	if (!pFile)
 		return INVALID_HANDLE_VALUE;
@@ -1429,17 +1563,19 @@ FILE* winpr_fopen(const char* path, const char* mode)
 #ifndef _WIN32
 	return fopen(path, mode);
 #else
-	LPWSTR lpPathW = NULL;
-	LPWSTR lpModeW = NULL;
-	FILE* result = NULL;
+	LPWSTR lpPathW = nullptr;
+	LPWSTR lpModeW = nullptr;
+	FILE* result = nullptr;
 
 	if (!path || !mode)
-		return NULL;
+		return nullptr;
 
-	if (ConvertToUnicode(CP_UTF8, 0, path, -1, &lpPathW, 0) < 1)
+	lpPathW = ConvertUtf8ToWCharAlloc(path, nullptr);
+	if (!lpPathW)
 		goto cleanup;
 
-	if (ConvertToUnicode(CP_UTF8, 0, mode, -1, &lpModeW, 0) < 1)
+	lpModeW = ConvertUtf8ToWCharAlloc(mode, nullptr);
+	if (!lpModeW)
 		goto cleanup;
 
 	result = _wfopen(lpPathW, lpModeW);
@@ -1450,3 +1586,37 @@ cleanup:
 	return result;
 #endif
 }
+
+#if !defined(_UWP) && !defined(_WIN32)
+DWORD GetLogicalDriveStringsW(DWORD nBufferLength, LPWSTR lpBuffer)
+{
+	char* buffer = nullptr;
+	if (nBufferLength > 0)
+	{
+		buffer = calloc(nBufferLength, sizeof(char));
+		if (!buffer)
+			return 0;
+	}
+
+	const DWORD rc = GetLogicalDriveStringsA(nBufferLength, buffer);
+	if (buffer)
+		ConvertMszUtf8NToWChar(buffer, rc, lpBuffer, nBufferLength);
+	free(buffer);
+	return rc;
+}
+
+DWORD GetLogicalDriveStringsA(DWORD nBufferLength, LPSTR lpBuffer)
+{
+	/* format is '<name1>\0<name2>\0...<nameX>\0\0'
+	 * for details see
+	 * https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getlogicaldrivestringsa
+	 */
+	const char path[] = "/\0";
+	const size_t len = sizeof(path);
+	if (nBufferLength < len)
+		return WINPR_ASSERTING_INT_CAST(DWORD, len);
+
+	memcpy(lpBuffer, path, len);
+	return len - 1;
+}
+#endif

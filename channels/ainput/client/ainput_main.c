@@ -45,6 +45,7 @@ struct AINPUT_PLUGIN_
 	AInputClientContext* context;
 	UINT32 MajorVersion;
 	UINT32 MinorVersion;
+	CRITICAL_SECTION lock;
 };
 
 /**
@@ -54,8 +55,8 @@ struct AINPUT_PLUGIN_
  */
 static UINT ainput_on_data_received(IWTSVirtualChannelCallback* pChannelCallback, wStream* data)
 {
-	UINT16 type;
-	AINPUT_PLUGIN* ainput;
+	UINT16 type = 0;
+	AINPUT_PLUGIN* ainput = nullptr;
 	GENERIC_CHANNEL_CALLBACK* callback = (GENERIC_CHANNEL_CALLBACK*)pChannelCallback;
 
 	WINPR_ASSERT(callback);
@@ -85,18 +86,15 @@ static UINT ainput_on_data_received(IWTSVirtualChannelCallback* pChannelCallback
 
 static UINT ainput_send_input_event(AInputClientContext* context, UINT64 flags, INT32 x, INT32 y)
 {
-	AINPUT_PLUGIN* ainput;
-	GENERIC_CHANNEL_CALLBACK* callback;
-	BYTE buffer[32] = { 0 };
-	UINT64 time;
-	wStream sbuffer = { 0 };
+	BYTE buffer[32] = WINPR_C_ARRAY_INIT;
+	wStream sbuffer = WINPR_C_ARRAY_INIT;
 	wStream* s = Stream_StaticInit(&sbuffer, buffer, sizeof(buffer));
 
 	WINPR_ASSERT(s);
 	WINPR_ASSERT(context);
 
-	time = GetTickCount64();
-	ainput = (AINPUT_PLUGIN*)context->handle;
+	const UINT64 time = GetTickCount64();
+	AINPUT_PLUGIN* ainput = (AINPUT_PLUGIN*)context->handle;
 	WINPR_ASSERT(ainput);
 
 	if (ainput->MajorVersion != AINPUT_VERSION_MAJOR)
@@ -105,13 +103,11 @@ static UINT ainput_send_input_event(AInputClientContext* context, UINT64 flags, 
 		          ainput->MajorVersion, ainput->MinorVersion);
 		return CHANNEL_RC_UNSUPPORTED_VERSION;
 	}
-	callback = ainput->base.listener_callback->channel_callback;
-	WINPR_ASSERT(callback);
 
 	{
-		char ebuffer[128] = { 0 };
-		WLog_VRB(TAG, "[%s] sending timestamp=0x%08" PRIx64 ", flags=%s, %" PRId32 "x%" PRId32,
-		         __FUNCTION__, time, ainput_flags_to_string(flags, ebuffer, sizeof(ebuffer)), x, y);
+		char ebuffer[128] = WINPR_C_ARRAY_INIT;
+		WLog_VRB(TAG, "sending timestamp=0x%08" PRIx64 ", flags=%s, %" PRId32 "x%" PRId32, time,
+		         ainput_flags_to_string(flags, ebuffer, sizeof(ebuffer)), x, y);
 	}
 
 	/* Message type */
@@ -125,10 +121,21 @@ static UINT ainput_send_input_event(AInputClientContext* context, UINT64 flags, 
 	Stream_SealLength(s);
 
 	/* ainput back what we have received. AINPUT does not have any message IDs. */
-	WINPR_ASSERT(callback->channel);
-	WINPR_ASSERT(callback->channel->Write);
-	return callback->channel->Write(callback->channel, (ULONG)Stream_Length(s), Stream_Buffer(s),
-	                                NULL);
+	UINT rc = CHANNEL_RC_NOT_OPEN;
+	EnterCriticalSection(&ainput->lock);
+	GENERIC_CHANNEL_CALLBACK* callback = ainput->base.listener_callback->channel_callback;
+	/* The channel might have been closed by the server in the meantime, ainput_on_close
+	 * resets the callback pointer in that case. Let the caller fall back to the default
+	 * input channel. */
+	if (callback)
+	{
+		WINPR_ASSERT(callback->channel);
+		WINPR_ASSERT(callback->channel->Write);
+		rc = callback->channel->Write(callback->channel, (ULONG)Stream_Length(s), Stream_Buffer(s),
+		                              nullptr);
+	}
+	LeaveCriticalSection(&ainput->lock);
+	return rc;
 }
 
 /**
@@ -140,12 +147,24 @@ static UINT ainput_on_close(IWTSVirtualChannelCallback* pChannelCallback)
 {
 	GENERIC_CHANNEL_CALLBACK* callback = (GENERIC_CHANNEL_CALLBACK*)pChannelCallback;
 
-	free(callback);
+	if (callback)
+	{
+		AINPUT_PLUGIN* ainput = (AINPUT_PLUGIN*)callback->plugin;
+		WINPR_ASSERT(ainput);
 
+		/* Lock here to ensure that no ainput_send_input_event is in progress and
+		 * reset the listener callback pointer so that no later one uses the freed callback. */
+		EnterCriticalSection(&ainput->lock);
+		if (ainput->base.listener_callback->channel_callback == callback)
+			ainput->base.listener_callback->channel_callback = nullptr;
+		free(callback);
+		LeaveCriticalSection(&ainput->lock);
+	}
 	return CHANNEL_RC_OK;
 }
 
-static UINT init_plugin_cb(GENERIC_DYNVC_PLUGIN* base, rdpContext* rcontext, rdpSettings* settings)
+static UINT init_plugin_cb(GENERIC_DYNVC_PLUGIN* base, WINPR_ATTR_UNUSED rdpContext* rcontext,
+                           WINPR_ATTR_UNUSED rdpSettings* settings)
 {
 	AINPUT_PLUGIN* ainput = (AINPUT_PLUGIN*)base;
 	AInputClientContext* context = (AInputClientContext*)calloc(1, sizeof(AInputClientContext));
@@ -155,27 +174,34 @@ static UINT init_plugin_cb(GENERIC_DYNVC_PLUGIN* base, rdpContext* rcontext, rdp
 	context->handle = (void*)base;
 	context->AInputSendInputEvent = ainput_send_input_event;
 
+	InitializeCriticalSection(&ainput->lock);
+
+	EnterCriticalSection(&ainput->lock);
 	ainput->context = context;
 	ainput->base.iface.pInterface = context;
+	LeaveCriticalSection(&ainput->lock);
 	return CHANNEL_RC_OK;
 }
 
 static void terminate_plugin_cb(GENERIC_DYNVC_PLUGIN* base)
 {
 	AINPUT_PLUGIN* ainput = (AINPUT_PLUGIN*)base;
+	WINPR_ASSERT(ainput);
+
+	DeleteCriticalSection(&ainput->lock);
 	free(ainput->context);
 }
 
 static const IWTSVirtualChannelCallback ainput_functions = { ainput_on_data_received,
-	                                                         NULL, /* Open */
-	                                                         ainput_on_close };
+	                                                         nullptr, /* Open */
+	                                                         ainput_on_close, nullptr };
 
 /**
  * Function description
  *
  * @return 0 on success, otherwise a Win32 error code
  */
-UINT ainput_DVCPluginEntry(IDRDYNVC_ENTRY_POINTS* pEntryPoints)
+FREERDP_ENTRY_POINT(UINT VCAPITYPE ainput_DVCPluginEntry(IDRDYNVC_ENTRY_POINTS* pEntryPoints))
 {
 	return freerdp_generic_DVCPluginEntry(pEntryPoints, TAG, AINPUT_DVC_CHANNEL_NAME,
 	                                      sizeof(AINPUT_PLUGIN), sizeof(GENERIC_CHANNEL_CALLBACK),

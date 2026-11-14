@@ -23,78 +23,83 @@
 #include <freerdp/api.h>
 #include <freerdp/types.h>
 #include <freerdp/update.h>
-#include <freerdp/freerdp.h>
 
 #include <winpr/crt.h>
 #include <winpr/stream.h>
-
-typedef struct rdp_persistent_cache rdpPersistentCache;
-
-#pragma pack(push, 1)
-
-/* 12 bytes */
-
-struct _PERSISTENT_CACHE_HEADER_V3
-{
-	BYTE sig[8];
-	UINT32 flags; /* 0x00000003, 0x00000006 */
-};
-typedef struct _PERSISTENT_CACHE_HEADER_V3 PERSISTENT_CACHE_HEADER_V3;
-
-/* 12 bytes */
-
-struct _PERSISTENT_CACHE_ENTRY_V3
-{
-	UINT64 key64;
-	UINT16 width;
-	UINT16 height;
-};
-typedef struct _PERSISTENT_CACHE_ENTRY_V3 PERSISTENT_CACHE_ENTRY_V3;
-
-/* 20 bytes */
-
-struct _PERSISTENT_CACHE_ENTRY_V2
-{
-	UINT64 key64;
-	UINT16 width;
-	UINT16 height;
-	UINT32 size;
-	UINT32 flags; /* 0x00000011 */
-};
-typedef struct _PERSISTENT_CACHE_ENTRY_V2 PERSISTENT_CACHE_ENTRY_V2;
-
-#pragma pack(pop)
-
-struct _PERSISTENT_CACHE_ENTRY
-{
-	UINT64 key64;
-	UINT16 width;
-	UINT16 height;
-	UINT32 size;
-	UINT32 flags;
-	BYTE* data;
-};
-typedef struct _PERSISTENT_CACHE_ENTRY PERSISTENT_CACHE_ENTRY;
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
+	typedef struct rdp_persistent_cache rdpPersistentCache;
+
+#pragma pack(push, 1)
+
+/* 12 bytes */
+
+	typedef struct
+	{
+		BYTE sig[8];
+		UINT32 flags; /* 0x00000003, 0x00000006 */
+	} PERSISTENT_CACHE_HEADER_V3;
+
+/* 12 bytes */
+
+	typedef struct
+	{
+		UINT64 key64;
+		UINT16 width;
+		UINT16 height;
+	} PERSISTENT_CACHE_ENTRY_V3;
+
+/* 20 bytes */
+
+	typedef struct
+	{
+		UINT64 key64;
+		UINT16 width;
+		UINT16 height;
+		UINT32 size;
+		UINT32 flags; /* 0x00000011 */
+	} PERSISTENT_CACHE_ENTRY_V2;
+
+#pragma pack(pop)
+
+	typedef struct
+	{
+		UINT64 key64;
+		UINT16 width;
+		UINT16 height;
+		UINT32 size;
+		UINT32 flags;
+		BYTE* data;
+	} PERSISTENT_CACHE_ENTRY;
+
+	WINPR_ATTR_NODISCARD
 	FREERDP_API int persistent_cache_get_version(rdpPersistentCache* persistent);
+
+	WINPR_ATTR_NODISCARD
 	FREERDP_API int persistent_cache_get_count(rdpPersistentCache* persistent);
 
+	WINPR_ATTR_NODISCARD
 	FREERDP_API int persistent_cache_read_entry(rdpPersistentCache* persistent,
 	                                            PERSISTENT_CACHE_ENTRY* entry);
+
+	WINPR_ATTR_NODISCARD
 	FREERDP_API int persistent_cache_write_entry(rdpPersistentCache* persistent,
 	                                             const PERSISTENT_CACHE_ENTRY* entry);
 
+	WINPR_ATTR_NODISCARD
 	FREERDP_API int persistent_cache_open(rdpPersistentCache* persistent, const char* filename,
 	                                      BOOL write, UINT32 version);
+
 	FREERDP_API int persistent_cache_close(rdpPersistentCache* persistent);
 
-	FREERDP_API rdpPersistentCache* persistent_cache_new(void);
 	FREERDP_API void persistent_cache_free(rdpPersistentCache* persistent);
+
+	WINPR_ATTR_MALLOC(persistent_cache_free, 1)
+	FREERDP_API rdpPersistentCache* persistent_cache_new(void);
 
 #ifdef __cplusplus
 }

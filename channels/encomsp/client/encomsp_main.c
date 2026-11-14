@@ -25,6 +25,7 @@
 #include <winpr/assert.h>
 #include <winpr/print.h>
 
+#include <freerdp/freerdp.h>
 #include <freerdp/channels/log.h>
 #include <freerdp/client/encomsp.h>
 
@@ -43,6 +44,8 @@ struct encomsp_plugin
 	DWORD OpenHandle;
 	wMessageQueue* queue;
 	rdpContext* rdpcontext;
+	BOOL firstFlagReceived;
+	UINT32 totalLength;
 };
 
 /**
@@ -52,6 +55,7 @@ struct encomsp_plugin
  */
 static UINT encomsp_read_header(wStream* s, ENCOMSP_ORDER_HEADER* header)
 {
+	WINPR_ASSERT(header);
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, ENCOMSP_ORDER_HEADER_SIZE))
 		return ERROR_INVALID_DATA;
 
@@ -67,6 +71,7 @@ static UINT encomsp_read_header(wStream* s, ENCOMSP_ORDER_HEADER* header)
  */
 static UINT encomsp_write_header(wStream* s, const ENCOMSP_ORDER_HEADER* header)
 {
+	WINPR_ASSERT(header);
 	Stream_Write_UINT16(s, header->Type);   /* Type (2 bytes) */
 	Stream_Write_UINT16(s, header->Length); /* Length (2 bytes) */
 	return CHANNEL_RC_OK;
@@ -79,7 +84,9 @@ static UINT encomsp_write_header(wStream* s, const ENCOMSP_ORDER_HEADER* header)
  */
 static UINT encomsp_read_unicode_string(wStream* s, ENCOMSP_UNICODE_STRING* str)
 {
-	ZeroMemory(str, sizeof(ENCOMSP_UNICODE_STRING));
+	WINPR_ASSERT(str);
+	const ENCOMSP_UNICODE_STRING empty = WINPR_C_ARRAY_INIT;
+	*str = empty;
 
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 2))
 		return ERROR_INVALID_DATA;
@@ -92,18 +99,17 @@ static UINT encomsp_read_unicode_string(wStream* s, ENCOMSP_UNICODE_STRING* str)
 		return ERROR_INVALID_DATA;
 	}
 
-	if (!Stream_CheckAndLogRequiredLength(TAG, s, sizeof(WCHAR) * str->cchString))
+	if (!Stream_CheckAndLogRequiredLengthOfSize(TAG, s, str->cchString, sizeof(WCHAR)))
 		return ERROR_INVALID_DATA;
 
-	Stream_Read(s, &(str->wString), (str->cchString * 2)); /* String (variable) */
+	Stream_Read(s, &(str->wString), (sizeof(WCHAR) * str->cchString)); /* String (variable) */
 	return CHANNEL_RC_OK;
 }
 
 static EncomspClientContext* encomsp_get_client_interface(encomspPlugin* encomsp)
 {
-	EncomspClientContext* pInterface;
-	pInterface = (EncomspClientContext*)encomsp->channelEntryPoints.pInterface;
-	return pInterface;
+	WINPR_ASSERT(encomsp);
+	return (EncomspClientContext*)encomsp->channelEntryPoints.pInterface;
 }
 
 /**
@@ -113,19 +119,13 @@ static EncomspClientContext* encomsp_get_client_interface(encomspPlugin* encomsp
  */
 static UINT encomsp_virtual_channel_write(encomspPlugin* encomsp, wStream* s)
 {
-	UINT status;
-
 	if (!encomsp)
 	{
 		Stream_Free(s, TRUE);
 		return ERROR_INVALID_HANDLE;
 	}
 
-#if 0
-	WLog_INFO(TAG, "EncomspWrite (%"PRIuz")", Stream_Length(s));
-	winpr_HexDump(Stream_Buffer(s), Stream_Length(s));
-#endif
-	status = encomsp->channelEntryPoints.pVirtualChannelWriteEx(
+	const UINT status = encomsp->channelEntryPoints.pVirtualChannelWriteEx(
 	    encomsp->InitHandle, encomsp->OpenHandle, Stream_Buffer(s), (UINT32)Stream_Length(s), s);
 
 	if (status != CHANNEL_RC_OK)
@@ -145,39 +145,41 @@ static UINT encomsp_virtual_channel_write(encomspPlugin* encomsp, wStream* s)
 static UINT encomsp_recv_filter_updated_pdu(encomspPlugin* encomsp, wStream* s,
                                             const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_FILTER_UPDATED_PDU pdu;
+	ENCOMSP_FILTER_UPDATED_PDU pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	context = encomsp_get_client_interface(encomsp);
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
 
-	pos = Stream_GetPosition(s);
+	WINPR_ASSERT(header);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
 
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 1))
 		return ERROR_INVALID_DATA;
 
 	Stream_Read_UINT8(s, pdu.Flags); /* Flags (1 byte) */
-	end = Stream_GetPosition(s);
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
 
-	if ((beg + header->Length) < end)
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->FilterUpdated, error, context, &pdu);
@@ -196,11 +198,8 @@ static UINT encomsp_recv_filter_updated_pdu(encomspPlugin* encomsp, wStream* s,
 static UINT encomsp_recv_application_created_pdu(encomspPlugin* encomsp, wStream* s,
                                                  const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_APPLICATION_CREATED_PDU pdu;
-	UINT error;
-	context = encomsp_get_client_interface(encomsp);
+	ENCOMSP_APPLICATION_CREATED_PDU pdu = WINPR_C_ARRAY_INIT;
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
@@ -208,35 +207,41 @@ static UINT encomsp_recv_application_created_pdu(encomspPlugin* encomsp, wStream
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 6))
 		return ERROR_INVALID_DATA;
 
-	pos = Stream_GetPosition(s);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
+
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
 
 	Stream_Read_UINT16(s, pdu.Flags); /* Flags (2 bytes) */
 	Stream_Read_UINT32(s, pdu.AppId); /* AppId (4 bytes) */
 
-	if ((error = encomsp_read_unicode_string(s, &(pdu.Name))))
+	UINT error = encomsp_read_unicode_string(s, &(pdu.Name));
+	if (error != CHANNEL_RC_OK)
 	{
 		WLog_ERR(TAG, "encomsp_read_unicode_string failed with error %" PRIu32 "", error);
 		return error;
 	}
 
-	end = Stream_GetPosition(s);
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
 
-	if ((beg + header->Length) < end)
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->ApplicationCreated, error, context, &pdu);
@@ -255,39 +260,42 @@ static UINT encomsp_recv_application_created_pdu(encomspPlugin* encomsp, wStream
 static UINT encomsp_recv_application_removed_pdu(encomspPlugin* encomsp, wStream* s,
                                                  const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_APPLICATION_REMOVED_PDU pdu;
+	ENCOMSP_APPLICATION_REMOVED_PDU pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	context = encomsp_get_client_interface(encomsp);
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
 
-	pos = Stream_GetPosition(s);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
+
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
 
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 4))
 		return ERROR_INVALID_DATA;
 
 	Stream_Read_UINT32(s, pdu.AppId); /* AppId (4 bytes) */
-	end = Stream_GetPosition(s);
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
 
-	if ((beg + header->Length) < end)
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->ApplicationRemoved, error, context, &pdu);
@@ -306,20 +314,21 @@ static UINT encomsp_recv_application_removed_pdu(encomspPlugin* encomsp, wStream
 static UINT encomsp_recv_window_created_pdu(encomspPlugin* encomsp, wStream* s,
                                             const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_WINDOW_CREATED_PDU pdu;
-	UINT error;
-	context = encomsp_get_client_interface(encomsp);
+	ENCOMSP_WINDOW_CREATED_PDU pdu = WINPR_C_ARRAY_INIT;
+	UINT error = CHANNEL_RC_OK;
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
 
-	pos = Stream_GetPosition(s);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
+
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
 
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 10))
 		return ERROR_INVALID_DATA;
@@ -334,20 +343,22 @@ static UINT encomsp_recv_window_created_pdu(encomspPlugin* encomsp, wStream* s,
 		return error;
 	}
 
-	end = Stream_GetPosition(s);
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
 
-	if ((beg + header->Length) < end)
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->WindowCreated, error, context, &pdu);
@@ -366,39 +377,42 @@ static UINT encomsp_recv_window_created_pdu(encomspPlugin* encomsp, wStream* s,
 static UINT encomsp_recv_window_removed_pdu(encomspPlugin* encomsp, wStream* s,
                                             const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_WINDOW_REMOVED_PDU pdu;
+	ENCOMSP_WINDOW_REMOVED_PDU pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	context = encomsp_get_client_interface(encomsp);
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
 
-	pos = Stream_GetPosition(s);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
+
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
 
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 4))
 		return ERROR_INVALID_DATA;
 
 	Stream_Read_UINT32(s, pdu.WndId); /* WndId (4 bytes) */
-	end = Stream_GetPosition(s);
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
 
-	if ((beg + header->Length) < end)
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->WindowRemoved, error, context, &pdu);
@@ -417,39 +431,42 @@ static UINT encomsp_recv_window_removed_pdu(encomspPlugin* encomsp, wStream* s,
 static UINT encomsp_recv_show_window_pdu(encomspPlugin* encomsp, wStream* s,
                                          const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_SHOW_WINDOW_PDU pdu;
+	ENCOMSP_SHOW_WINDOW_PDU pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	context = encomsp_get_client_interface(encomsp);
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
 
-	pos = Stream_GetPosition(s);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
+
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
 
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 4))
 		return ERROR_INVALID_DATA;
 
 	Stream_Read_UINT32(s, pdu.WndId); /* WndId (4 bytes) */
-	end = Stream_GetPosition(s);
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
 
-	if ((beg + header->Length) < end)
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->ShowWindow, error, context, &pdu);
@@ -468,20 +485,20 @@ static UINT encomsp_recv_show_window_pdu(encomspPlugin* encomsp, wStream* s,
 static UINT encomsp_recv_participant_created_pdu(encomspPlugin* encomsp, wStream* s,
                                                  const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_PARTICIPANT_CREATED_PDU pdu;
-	UINT error;
-	context = encomsp_get_client_interface(encomsp);
+	ENCOMSP_PARTICIPANT_CREATED_PDU pdu = WINPR_C_ARRAY_INIT;
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
 
-	pos = Stream_GetPosition(s);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
+
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
 
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 10))
 		return ERROR_INVALID_DATA;
@@ -490,26 +507,29 @@ static UINT encomsp_recv_participant_created_pdu(encomspPlugin* encomsp, wStream
 	Stream_Read_UINT32(s, pdu.GroupId);       /* GroupId (4 bytes) */
 	Stream_Read_UINT16(s, pdu.Flags);         /* Flags (2 bytes) */
 
-	if ((error = encomsp_read_unicode_string(s, &(pdu.FriendlyName))))
+	UINT error = encomsp_read_unicode_string(s, &(pdu.FriendlyName));
+	if (error != CHANNEL_RC_OK)
 	{
 		WLog_ERR(TAG, "encomsp_read_unicode_string failed with error %" PRIu32 "", error);
 		return error;
 	}
 
-	end = Stream_GetPosition(s);
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
 
-	if ((beg + header->Length) < end)
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->ParticipantCreated, error, context, &pdu);
@@ -528,11 +548,9 @@ static UINT encomsp_recv_participant_created_pdu(encomspPlugin* encomsp, wStream
 static UINT encomsp_recv_participant_removed_pdu(encomspPlugin* encomsp, wStream* s,
                                                  const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end;
-	EncomspClientContext* context;
-	ENCOMSP_PARTICIPANT_REMOVED_PDU pdu;
+	ENCOMSP_PARTICIPANT_REMOVED_PDU pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	context = encomsp_get_client_interface(encomsp);
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
@@ -540,26 +558,31 @@ static UINT encomsp_recv_participant_removed_pdu(encomspPlugin* encomsp, wStream
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 12))
 		return ERROR_INVALID_DATA;
 
-	beg = (Stream_GetPosition(s)) - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
+	const size_t beg = (Stream_GetPosition(s)) - ENCOMSP_ORDER_HEADER_SIZE;
+
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
 
 	Stream_Read_UINT32(s, pdu.ParticipantId); /* ParticipantId (4 bytes) */
 	Stream_Read_UINT32(s, pdu.DiscType);      /* DiscType (4 bytes) */
 	Stream_Read_UINT32(s, pdu.DiscCode);      /* DiscCode (4 bytes) */
-	end = Stream_GetPosition(s);
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
 
-	if ((beg + header->Length) < end)
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->ParticipantRemoved, error, context, &pdu);
@@ -578,40 +601,43 @@ static UINT encomsp_recv_participant_removed_pdu(encomspPlugin* encomsp, wStream
 static UINT encomsp_recv_change_participant_control_level_pdu(encomspPlugin* encomsp, wStream* s,
                                                               const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_CHANGE_PARTICIPANT_CONTROL_LEVEL_PDU pdu;
+	ENCOMSP_CHANGE_PARTICIPANT_CONTROL_LEVEL_PDU pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	context = encomsp_get_client_interface(encomsp);
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
 
-	pos = Stream_GetPosition(s);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
+
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
 
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 6))
 		return ERROR_INVALID_DATA;
 
 	Stream_Read_UINT16(s, pdu.Flags);         /* Flags (2 bytes) */
 	Stream_Read_UINT32(s, pdu.ParticipantId); /* ParticipantId (4 bytes) */
-	end = Stream_GetPosition(s);
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
 
-	if ((beg + header->Length) < end)
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->ChangeParticipantControlLevel, error, context, &pdu);
@@ -631,15 +657,15 @@ static UINT encomsp_recv_change_participant_control_level_pdu(encomspPlugin* enc
 static UINT encomsp_send_change_participant_control_level_pdu(
     EncomspClientContext* context, const ENCOMSP_CHANGE_PARTICIPANT_CONTROL_LEVEL_PDU* pdu)
 {
-	wStream* s;
-	encomspPlugin* encomsp;
-	UINT error;
-	ENCOMSP_ORDER_HEADER header;
+	ENCOMSP_ORDER_HEADER header = WINPR_C_ARRAY_INIT;
 
-	encomsp = (encomspPlugin*)context->handle;
+	WINPR_ASSERT(context);
+	encomspPlugin* encomsp = (encomspPlugin*)context->handle;
+
 	header.Type = ODTYPE_PARTICIPANT_CTRL_CHANGED;
 	header.Length = ENCOMSP_ORDER_HEADER_SIZE + 6;
-	s = Stream_New(NULL, header.Length);
+
+	wStream* s = Stream_New(nullptr, header.Length);
 
 	if (!s)
 	{
@@ -647,7 +673,8 @@ static UINT encomsp_send_change_participant_control_level_pdu(
 		return CHANNEL_RC_NO_MEMORY;
 	}
 
-	if ((error = encomsp_write_header(s, &header)))
+	const UINT error = encomsp_write_header(s, &header);
+	if (error != CHANNEL_RC_OK)
 	{
 		WLog_ERR(TAG, "encomsp_write_header failed with error %" PRIu32 "!", error);
 		return error;
@@ -667,34 +694,38 @@ static UINT encomsp_send_change_participant_control_level_pdu(
 static UINT encomsp_recv_graphics_stream_paused_pdu(encomspPlugin* encomsp, wStream* s,
                                                     const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_GRAPHICS_STREAM_PAUSED_PDU pdu;
+	ENCOMSP_GRAPHICS_STREAM_PAUSED_PDU pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	context = encomsp_get_client_interface(encomsp);
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
 
-	pos = Stream_GetPosition(s);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
-	end = Stream_GetPosition(s);
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
 
-	if ((beg + header->Length) < end)
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
+
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
+
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->GraphicsStreamPaused, error, context, &pdu);
@@ -713,34 +744,38 @@ static UINT encomsp_recv_graphics_stream_paused_pdu(encomspPlugin* encomsp, wStr
 static UINT encomsp_recv_graphics_stream_resumed_pdu(encomspPlugin* encomsp, wStream* s,
                                                      const ENCOMSP_ORDER_HEADER* header)
 {
-	size_t beg, end, pos;
-	EncomspClientContext* context;
-	ENCOMSP_GRAPHICS_STREAM_RESUMED_PDU pdu;
+	ENCOMSP_GRAPHICS_STREAM_RESUMED_PDU pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	context = encomsp_get_client_interface(encomsp);
+	EncomspClientContext* context = encomsp_get_client_interface(encomsp);
 
 	if (!context)
 		return ERROR_INVALID_HANDLE;
 
-	pos = Stream_GetPosition(s);
+	const size_t pos = Stream_GetPosition(s);
 	if (pos < ENCOMSP_ORDER_HEADER_SIZE)
 		return ERROR_INVALID_DATA;
-	beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
-	CopyMemory(&pdu, header, sizeof(ENCOMSP_ORDER_HEADER));
-	end = Stream_GetPosition(s);
+	const size_t beg = pos - ENCOMSP_ORDER_HEADER_SIZE;
 
-	if ((beg + header->Length) < end)
+	WINPR_ASSERT(header);
+	pdu.Length = header->Length;
+	pdu.Type = header->Type;
+
+	const size_t end = Stream_GetPosition(s);
+	const size_t body = beg + header->Length;
+
+	if (body < end)
 	{
 		WLog_ERR(TAG, "Not enough data!");
 		return ERROR_INVALID_DATA;
 	}
 
-	if ((beg + header->Length) > end)
+	if (body > end)
 	{
-		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)((beg + header->Length) - end)))
+		if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(body - end)))
 			return ERROR_INVALID_DATA;
 
-		Stream_SetPosition(s, (beg + header->Length));
+		if (!Stream_SetPosition(s, body))
+			return ERROR_INVALID_DATA;
 	}
 
 	IFCALLRET(context->GraphicsStreamResumed, error, context, &pdu);
@@ -759,8 +794,9 @@ static UINT encomsp_recv_graphics_stream_resumed_pdu(encomspPlugin* encomsp, wSt
 static UINT encomsp_process_receive(encomspPlugin* encomsp, wStream* s)
 {
 	UINT error = CHANNEL_RC_OK;
-	ENCOMSP_ORDER_HEADER header;
+	ENCOMSP_ORDER_HEADER header = WINPR_C_ARRAY_INIT;
 
+	WINPR_ASSERT(encomsp);
 	while (Stream_GetRemainingLength(s) > 0)
 	{
 		if ((error = encomsp_read_header(s, &header)))
@@ -904,10 +940,6 @@ static UINT encomsp_process_receive(encomspPlugin* encomsp, wStream* s)
 	return error;
 }
 
-static void encomsp_process_connect(encomspPlugin* encomsp)
-{
-}
-
 /**
  * Function description
  *
@@ -917,26 +949,32 @@ static UINT encomsp_virtual_channel_event_data_received(encomspPlugin* encomsp, 
                                                         UINT32 dataLength, UINT32 totalLength,
                                                         UINT32 dataFlags)
 {
-	wStream* data_in;
+	WINPR_ASSERT(encomsp);
 
 	if ((dataFlags & CHANNEL_FLAG_SUSPEND) || (dataFlags & CHANNEL_FLAG_RESUME))
 		return CHANNEL_RC_OK;
 
 	if (dataFlags & CHANNEL_FLAG_FIRST)
 	{
+		if (encomsp->firstFlagReceived)
+			return ERROR_INVALID_DATA;
+		encomsp->firstFlagReceived = TRUE;
 		if (encomsp->data_in)
 			Stream_Free(encomsp->data_in, TRUE);
 
-		encomsp->data_in = Stream_New(NULL, totalLength);
+		encomsp->data_in = Stream_New(nullptr, dataLength);
 
 		if (!encomsp->data_in)
 		{
 			WLog_ERR(TAG, "Stream_New failed!");
 			return CHANNEL_RC_NO_MEMORY;
 		}
+		encomsp->totalLength = totalLength;
 	}
 
-	data_in = encomsp->data_in;
+	wStream* data_in = encomsp->data_in;
+	if (!data_in)
+		return ERROR_INVALID_DATA;
 
 	if (!Stream_EnsureRemainingCapacity(data_in, dataLength))
 	{
@@ -946,19 +984,27 @@ static UINT encomsp_virtual_channel_event_data_received(encomspPlugin* encomsp, 
 
 	Stream_Write(data_in, pData, dataLength);
 
+	if ((Stream_GetPosition(data_in) > totalLength) || (encomsp->totalLength != totalLength))
+		return ERROR_INVALID_DATA;
+
 	if (dataFlags & CHANNEL_FLAG_LAST)
 	{
+		if (!encomsp->firstFlagReceived)
+			return ERROR_INVALID_DATA;
+		encomsp->firstFlagReceived = FALSE;
+
 		if (Stream_Capacity(data_in) != Stream_GetPosition(data_in))
 		{
 			WLog_ERR(TAG, "encomsp_plugin_process_received: read error");
 			return ERROR_INVALID_DATA;
 		}
 
-		encomsp->data_in = NULL;
+		encomsp->totalLength = 0;
+		encomsp->data_in = nullptr;
 		Stream_SealLength(data_in);
-		Stream_SetPosition(data_in, 0);
+		Stream_ResetPosition(data_in);
 
-		if (!MessageQueue_Post(encomsp->queue, NULL, 0, (void*)data_in, NULL))
+		if (!MessageQueue_Post(encomsp->queue, nullptr, 0, (void*)data_in, nullptr))
 		{
 			WLog_ERR(TAG, "MessageQueue_Post failed!");
 			return ERROR_INTERNAL_ERROR;
@@ -1003,23 +1049,23 @@ static VOID VCAPITYPE encomsp_virtual_channel_open_event_ex(LPVOID lpUserParam, 
 
 		case CHANNEL_EVENT_USER:
 			break;
+		default:
+			break;
 	}
 
 	if (error && encomsp && encomsp->rdpcontext)
 		setChannelError(encomsp->rdpcontext, error,
 		                "encomsp_virtual_channel_open_event reported an error");
-
-	return;
 }
 
 static DWORD WINAPI encomsp_virtual_channel_client_thread(LPVOID arg)
 {
-	wStream* data;
-	wMessage message;
+	wStream* data = nullptr;
+	wMessage message = WINPR_C_ARRAY_INIT;
 	encomspPlugin* encomsp = (encomspPlugin*)arg;
 	UINT error = CHANNEL_RC_OK;
-	encomsp_process_connect(encomsp);
 
+	WINPR_ASSERT(encomsp);
 	while (1)
 	{
 		if (!MessageQueue_Wait(encomsp->queue))
@@ -1067,12 +1113,13 @@ static DWORD WINAPI encomsp_virtual_channel_client_thread(LPVOID arg)
  *
  * @return 0 on success, otherwise a Win32 error code
  */
-static UINT encomsp_virtual_channel_event_connected(encomspPlugin* encomsp, LPVOID pData,
-                                                    UINT32 dataLength)
+static UINT encomsp_virtual_channel_event_connected(encomspPlugin* encomsp,
+                                                    WINPR_ATTR_UNUSED LPVOID pData,
+                                                    WINPR_ATTR_UNUSED UINT32 dataLength)
 {
 	WINPR_ASSERT(encomsp);
 
-	encomsp->queue = MessageQueue_New(NULL);
+	encomsp->queue = MessageQueue_New(nullptr);
 
 	if (!encomsp->queue)
 	{
@@ -1080,8 +1127,8 @@ static UINT encomsp_virtual_channel_event_connected(encomspPlugin* encomsp, LPVO
 		return CHANNEL_RC_NO_MEMORY;
 	}
 
-	if (!(encomsp->thread = CreateThread(NULL, 0, encomsp_virtual_channel_client_thread,
-	                                     (void*)encomsp, 0, NULL)))
+	if (!(encomsp->thread = CreateThread(nullptr, 0, encomsp_virtual_channel_client_thread,
+	                                     (void*)encomsp, 0, nullptr)))
 	{
 		WLog_ERR(TAG, "CreateThread failed!");
 		MessageQueue_Free(encomsp->queue);
@@ -1100,8 +1147,7 @@ static UINT encomsp_virtual_channel_event_connected(encomspPlugin* encomsp, LPVO
  */
 static UINT encomsp_virtual_channel_event_disconnected(encomspPlugin* encomsp)
 {
-	UINT rc;
-
+	WINPR_ASSERT(encomsp);
 	if (encomsp->OpenHandle == 0)
 		return CHANNEL_RC_OK;
 
@@ -1110,20 +1156,20 @@ static UINT encomsp_virtual_channel_event_disconnected(encomspPlugin* encomsp)
 		if (MessageQueue_PostQuit(encomsp->queue, 0) &&
 		    (WaitForSingleObject(encomsp->thread, INFINITE) == WAIT_FAILED))
 		{
-			rc = GetLastError();
+			const UINT rc = GetLastError();
 			WLog_ERR(TAG, "WaitForSingleObject failed with error %" PRIu32 "", rc);
 			return rc;
 		}
 	}
 
 	MessageQueue_Free(encomsp->queue);
-	CloseHandle(encomsp->thread);
-	encomsp->queue = NULL;
-	encomsp->thread = NULL;
+	(void)CloseHandle(encomsp->thread);
+	encomsp->queue = nullptr;
+	encomsp->thread = nullptr;
 
 	WINPR_ASSERT(encomsp->channelEntryPoints.pVirtualChannelCloseEx);
-	rc = encomsp->channelEntryPoints.pVirtualChannelCloseEx(encomsp->InitHandle,
-	                                                        encomsp->OpenHandle);
+	const UINT rc = encomsp->channelEntryPoints.pVirtualChannelCloseEx(encomsp->InitHandle,
+	                                                                   encomsp->OpenHandle);
 
 	if (CHANNEL_RC_OK != rc)
 	{
@@ -1137,7 +1183,7 @@ static UINT encomsp_virtual_channel_event_disconnected(encomspPlugin* encomsp)
 	if (encomsp->data_in)
 	{
 		Stream_Free(encomsp->data_in, TRUE);
-		encomsp->data_in = NULL;
+		encomsp->data_in = nullptr;
 	}
 
 	return CHANNEL_RC_OK;
@@ -1150,7 +1196,9 @@ static UINT encomsp_virtual_channel_event_disconnected(encomspPlugin* encomsp)
  */
 static UINT encomsp_virtual_channel_event_terminated(encomspPlugin* encomsp)
 {
-	encomsp->InitHandle = 0;
+	WINPR_ASSERT(encomsp);
+
+	encomsp->InitHandle = nullptr;
 	free(encomsp->context);
 	free(encomsp);
 	return CHANNEL_RC_OK;
@@ -1206,14 +1254,11 @@ static VOID VCAPITYPE encomsp_virtual_channel_init_event_ex(LPVOID lpUserParam, 
 /* encomsp is always built-in */
 #define VirtualChannelEntryEx encomsp_VirtualChannelEntryEx
 
-BOOL VCAPITYPE VirtualChannelEntryEx(PCHANNEL_ENTRY_POINTS_EX pEntryPoints, PVOID pInitHandle)
+FREERDP_ENTRY_POINT(BOOL VCAPITYPE VirtualChannelEntryEx(PCHANNEL_ENTRY_POINTS_EX pEntryPoints,
+                                                         PVOID pInitHandle))
 {
-	UINT rc;
-	encomspPlugin* encomsp;
-	EncomspClientContext* context = NULL;
-	CHANNEL_ENTRY_POINTS_FREERDP_EX* pEntryPointsEx;
 	BOOL isFreerdp = FALSE;
-	encomsp = (encomspPlugin*)calloc(1, sizeof(encomspPlugin));
+	encomspPlugin* encomsp = (encomspPlugin*)calloc(1, sizeof(encomspPlugin));
 
 	if (!encomsp)
 	{
@@ -1223,10 +1268,13 @@ BOOL VCAPITYPE VirtualChannelEntryEx(PCHANNEL_ENTRY_POINTS_EX pEntryPoints, PVOI
 
 	encomsp->channelDef.options = CHANNEL_OPTION_INITIALIZED | CHANNEL_OPTION_ENCRYPT_RDP |
 	                              CHANNEL_OPTION_COMPRESS_RDP | CHANNEL_OPTION_SHOW_PROTOCOL;
-	sprintf_s(encomsp->channelDef.name, ARRAYSIZE(encomsp->channelDef.name),
-	          ENCOMSP_SVC_CHANNEL_NAME);
-	pEntryPointsEx = (CHANNEL_ENTRY_POINTS_FREERDP_EX*)pEntryPoints;
+	(void)sprintf_s(encomsp->channelDef.name, ARRAYSIZE(encomsp->channelDef.name),
+	                ENCOMSP_SVC_CHANNEL_NAME);
+	CHANNEL_ENTRY_POINTS_FREERDP_EX* pEntryPointsEx =
+	    (CHANNEL_ENTRY_POINTS_FREERDP_EX*)pEntryPoints;
+	WINPR_ASSERT(pEntryPointsEx);
 
+	EncomspClientContext* context = nullptr;
 	if ((pEntryPointsEx->cbSize >= sizeof(CHANNEL_ENTRY_POINTS_FREERDP_EX)) &&
 	    (pEntryPointsEx->MagicNumber == FREERDP_CHANNEL_MAGIC_NUMBER))
 	{
@@ -1239,17 +1287,17 @@ BOOL VCAPITYPE VirtualChannelEntryEx(PCHANNEL_ENTRY_POINTS_EX pEntryPoints, PVOI
 		}
 
 		context->handle = (void*)encomsp;
-		context->FilterUpdated = NULL;
-		context->ApplicationCreated = NULL;
-		context->ApplicationRemoved = NULL;
-		context->WindowCreated = NULL;
-		context->WindowRemoved = NULL;
-		context->ShowWindow = NULL;
-		context->ParticipantCreated = NULL;
-		context->ParticipantRemoved = NULL;
+		context->FilterUpdated = nullptr;
+		context->ApplicationCreated = nullptr;
+		context->ApplicationRemoved = nullptr;
+		context->WindowCreated = nullptr;
+		context->WindowRemoved = nullptr;
+		context->ShowWindow = nullptr;
+		context->ParticipantCreated = nullptr;
+		context->ParticipantRemoved = nullptr;
 		context->ChangeParticipantControlLevel = encomsp_send_change_participant_control_level_pdu;
-		context->GraphicsStreamPaused = NULL;
-		context->GraphicsStreamResumed = NULL;
+		context->GraphicsStreamPaused = nullptr;
+		context->GraphicsStreamResumed = nullptr;
 		encomsp->context = context;
 		encomsp->rdpcontext = pEntryPointsEx->context;
 		isFreerdp = TRUE;
@@ -1258,14 +1306,17 @@ BOOL VCAPITYPE VirtualChannelEntryEx(PCHANNEL_ENTRY_POINTS_EX pEntryPoints, PVOI
 	CopyMemory(&(encomsp->channelEntryPoints), pEntryPoints,
 	           sizeof(CHANNEL_ENTRY_POINTS_FREERDP_EX));
 	encomsp->InitHandle = pInitHandle;
-	rc = encomsp->channelEntryPoints.pVirtualChannelInitEx(
-	    encomsp, context, pInitHandle, &encomsp->channelDef, 1, VIRTUAL_CHANNEL_VERSION_WIN2000,
-	    encomsp_virtual_channel_init_event_ex);
 
-	if (CHANNEL_RC_OK != rc)
 	{
-		WLog_ERR(TAG, "failed with %s [%08" PRIX32 "]", WTSErrorToString(rc), rc);
-		goto error_out;
+		const UINT rc = encomsp->channelEntryPoints.pVirtualChannelInitEx(
+		    encomsp, context, pInitHandle, &encomsp->channelDef, 1, VIRTUAL_CHANNEL_VERSION_WIN2000,
+		    encomsp_virtual_channel_init_event_ex);
+
+		if (CHANNEL_RC_OK != rc)
+		{
+			WLog_ERR(TAG, "failed with %s [%08" PRIX32 "]", WTSErrorToString(rc), rc);
+			goto error_out;
+		}
 	}
 
 	encomsp->channelEntryPoints.pInterface = context;

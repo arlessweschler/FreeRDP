@@ -63,7 +63,7 @@
  * |         ...        |
  */
 
-static void tpdu_write_header(wStream* s, UINT16 length, BYTE code);
+static BOOL tpdu_write_header(wStream* s, UINT16 length, BYTE code);
 
 /**
  * Read TPDU header.
@@ -114,9 +114,19 @@ BOOL tpdu_read_header(wStream* s, BYTE* code, BYTE* li, UINT16 tpktlength)
  * @param code TPDU code
  */
 
-void tpdu_write_header(wStream* s, UINT16 length, BYTE code)
+BOOL tpdu_write_header(wStream* s, UINT16 length, BYTE code)
 {
-	Stream_Write_UINT8(s, length); /* LI */
+	if (length > UINT8_MAX)
+	{
+		WLog_WARN(TAG, "tpdu invalid length, got %" PRIu16 ", maximum supported is %d", length,
+		          UINT8_MAX);
+		return FALSE;
+	}
+	if (!Stream_CheckAndLogRequiredCapacity(TAG, (s), 3))
+		return FALSE;
+
+	WINPR_ASSERT(length <= UINT8_MAX);
+	Stream_Write_UINT8(s, (UINT8)length); /* LI */
 	Stream_Write_UINT8(s, code);   /* code */
 
 	if (code == X224_TPDU_DATA)
@@ -125,10 +135,13 @@ void tpdu_write_header(wStream* s, UINT16 length, BYTE code)
 	}
 	else
 	{
+		if (!Stream_CheckAndLogRequiredCapacity(TAG, (s), 5))
+			return FALSE;
 		Stream_Write_UINT16(s, 0); /* DST-REF */
 		Stream_Write_UINT16(s, 0); /* SRC-REF */
 		Stream_Write_UINT8(s, 0);  /* Class 0 */
 	}
+	return TRUE;
 }
 
 /**
@@ -139,7 +152,7 @@ void tpdu_write_header(wStream* s, UINT16 length, BYTE code)
 
 BOOL tpdu_read_connection_request(wStream* s, BYTE* li, UINT16 tpktlength)
 {
-	BYTE code;
+	BYTE code = 0;
 
 	if (!tpdu_read_header(s, &code, li, tpktlength))
 		return FALSE;
@@ -159,9 +172,9 @@ BOOL tpdu_read_connection_request(wStream* s, BYTE* li, UINT16 tpktlength)
  * @param length TPDU length
  */
 
-void tpdu_write_connection_request(wStream* s, UINT16 length)
+BOOL tpdu_write_connection_request(wStream* s, UINT16 length)
 {
-	tpdu_write_header(s, length, X224_TPDU_CONNECTION_REQUEST);
+	return tpdu_write_header(s, length, X224_TPDU_CONNECTION_REQUEST);
 }
 
 /**
@@ -172,8 +185,8 @@ void tpdu_write_connection_request(wStream* s, UINT16 length)
 
 BOOL tpdu_read_connection_confirm(wStream* s, BYTE* li, UINT16 tpktlength)
 {
-	BYTE code;
-	size_t position;
+	BYTE code = 0;
+	size_t position = 0;
 	size_t bytes_read = 0;
 
 	/* save the position to determine the number of bytes read */
@@ -196,9 +209,7 @@ BOOL tpdu_read_connection_confirm(wStream* s, BYTE* li, UINT16 tpktlength)
 	 */
 	bytes_read = (Stream_GetPosition(s) - position) - 1;
 
-	if (!Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(*li - bytes_read)))
-		return FALSE;
-	return TRUE;
+	return Stream_CheckAndLogRequiredLength(TAG, s, (size_t)(*li - bytes_read));
 }
 
 /**
@@ -207,9 +218,9 @@ BOOL tpdu_read_connection_confirm(wStream* s, BYTE* li, UINT16 tpktlength)
  * @param length TPDU length
  */
 
-void tpdu_write_connection_confirm(wStream* s, UINT16 length)
+BOOL tpdu_write_connection_confirm(wStream* s, UINT16 length)
 {
-	tpdu_write_header(s, length, X224_TPDU_CONNECTION_CONFIRM);
+	return tpdu_write_header(s, length, X224_TPDU_CONNECTION_CONFIRM);
 }
 
 /**
@@ -218,9 +229,9 @@ void tpdu_write_connection_confirm(wStream* s, UINT16 length)
  * @param length TPDU length
  */
 
-void tpdu_write_disconnect_request(wStream* s, UINT16 length)
+BOOL tpdu_write_disconnect_request(wStream* s, UINT16 length)
 {
-	tpdu_write_header(s, length, X224_TPDU_DISCONNECT_REQUEST);
+	return tpdu_write_header(s, length, X224_TPDU_DISCONNECT_REQUEST);
 }
 
 /**
@@ -228,9 +239,9 @@ void tpdu_write_disconnect_request(wStream* s, UINT16 length)
  * @param s stream
  */
 
-void tpdu_write_data(wStream* s)
+BOOL tpdu_write_data(wStream* s)
 {
-	tpdu_write_header(s, 2, X224_TPDU_DATA);
+	return tpdu_write_header(s, 2, X224_TPDU_DATA);
 }
 
 /**
@@ -240,14 +251,19 @@ void tpdu_write_data(wStream* s)
 
 BOOL tpdu_read_data(wStream* s, UINT16* LI, UINT16 tpktlength)
 {
-	BYTE code;
-	BYTE li;
+	BYTE code = 0;
+	BYTE li = 0;
 
 	if (!tpdu_read_header(s, &code, &li, tpktlength))
 		return FALSE;
 
 	if (code != X224_TPDU_DATA)
+	{
+		const BYTE dCode = X224_TPDU_DATA;
+		WLog_ERR(TAG, "tpdu got code 0x%02" PRIx8 " expected X224_TPDU_DATA [0x%02" PRIx8 "]", code,
+		         dCode);
 		return FALSE;
+	}
 
 	*LI = li;
 

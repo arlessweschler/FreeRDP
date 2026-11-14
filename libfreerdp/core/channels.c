@@ -20,11 +20,14 @@
 
 #include <freerdp/config.h>
 
+#include "settings.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <winpr/crt.h>
+#include <winpr/assert.h>
 #include <winpr/stream.h>
 #include <winpr/wtsapi.h>
 
@@ -49,14 +52,18 @@
 
 BOOL freerdp_channel_send(rdpRdp* rdp, UINT16 channelId, const BYTE* data, size_t size)
 {
-	DWORD i;
-	size_t left;
-	UINT32 flags;
-	size_t chunkSize;
-	rdpMcs* mcs = rdp->mcs;
-	const rdpMcsChannel* channel = NULL;
+	size_t left = 0;
+	UINT32 flags = 0;
+	size_t chunkSize = 0;
+	rdpMcs* mcs = nullptr;
+	const rdpMcsChannel* channel = nullptr;
 
-	for (i = 0; i < mcs->channelCount; i++)
+	WINPR_ASSERT(rdp);
+	WINPR_ASSERT(data || (size == 0));
+
+	mcs = rdp->mcs;
+	WINPR_ASSERT(mcs);
+	for (UINT32 i = 0; i < mcs->channelCount; i++)
 	{
 		const rdpMcsChannel* cur = &mcs->channels[i];
 		if (cur->ChannelId == channelId)
@@ -75,11 +82,13 @@ BOOL freerdp_channel_send(rdpRdp* rdp, UINT16 channelId, const BYTE* data, size_
 	flags = CHANNEL_FLAG_FIRST;
 	left = size;
 
+	const UINT32 VCChunkSize = freerdp_settings_get_uint32(rdp->settings, FreeRDP_VCChunkSize);
+	const BOOL ServerMode = freerdp_settings_get_bool(rdp->settings, FreeRDP_ServerMode);
 	while (left > 0)
 	{
-		if (left > rdp->settings->VirtualChannelChunkSize)
+		if (left > VCChunkSize)
 		{
-			chunkSize = rdp->settings->VirtualChannelChunkSize;
+			chunkSize = VCChunkSize;
 		}
 		else
 		{
@@ -87,7 +96,7 @@ BOOL freerdp_channel_send(rdpRdp* rdp, UINT16 channelId, const BYTE* data, size_
 			flags |= CHANNEL_FLAG_LAST;
 		}
 
-		if (!rdp->settings->ServerMode && (channel->options & CHANNEL_OPTION_SHOW_PROTOCOL))
+		if (!ServerMode && (channel->options & CHANNEL_OPTION_SHOW_PROTOCOL))
 		{
 			flags |= CHANNEL_FLAG_SHOW_PROTOCOL;
 		}
@@ -106,13 +115,15 @@ BOOL freerdp_channel_send(rdpRdp* rdp, UINT16 channelId, const BYTE* data, size_
 BOOL freerdp_channel_process(freerdp* instance, wStream* s, UINT16 channelId, size_t packetLength)
 {
 	BOOL rc = FALSE;
-	UINT32 length;
-	UINT32 flags;
-	size_t chunkLength;
+	UINT32 length = 0;
+	UINT32 flags = 0;
+	size_t chunkLength = 0;
+
+	WINPR_ASSERT(instance);
 
 	if (packetLength < 8)
 	{
-		WLog_ERR(TAG, "Header length %" PRIdz " bytes promised, none available", packetLength);
+		WLog_ERR(TAG, "Header length %" PRIuz " bytes promised, none available", packetLength);
 		return FALSE;
 	}
 	packetLength -= 8;
@@ -130,15 +141,11 @@ BOOL freerdp_channel_process(freerdp* instance, wStream* s, UINT16 channelId, si
 	chunkLength = Stream_GetRemainingLength(s);
 	if (packetLength != chunkLength)
 	{
-		WLog_ERR(TAG, "Header length %" PRIdz " != actual length %" PRIdz, packetLength,
+		WLog_ERR(TAG, "Header length %" PRIuz " != actual length %" PRIuz, packetLength,
 		         chunkLength);
 		return FALSE;
 	}
-	if (length < chunkLength)
-	{
-		WLog_ERR(TAG, "Expected %" PRIu32 " bytes, but have %" PRIdz, length, chunkLength);
-		return FALSE;
-	}
+
 	IFCALLRET(instance->ReceiveChannelData, rc, instance, channelId, Stream_Pointer(s), chunkLength,
 	          flags, length);
 	if (!rc)
@@ -152,9 +159,8 @@ BOOL freerdp_channel_process(freerdp* instance, wStream* s, UINT16 channelId, si
 
 BOOL freerdp_channel_peer_process(freerdp_peer* client, wStream* s, UINT16 channelId)
 {
-	UINT32 length;
-	UINT32 flags;
-	size_t chunkLength;
+	UINT32 length = 0;
+	UINT32 flags = 0;
 
 	WINPR_ASSERT(client);
 	WINPR_ASSERT(s);
@@ -164,21 +170,21 @@ BOOL freerdp_channel_peer_process(freerdp_peer* client, wStream* s, UINT16 chann
 
 	Stream_Read_UINT32(s, length);
 	Stream_Read_UINT32(s, flags);
-	chunkLength = Stream_GetRemainingLength(s);
+	const size_t chunkLength = Stream_GetRemainingLength(s);
+	if (chunkLength > UINT32_MAX)
+		return FALSE;
 
 	if (client->VirtualChannelRead)
 	{
-		int rc;
-		UINT32 index;
+		int rc = 0;
 		BOOL found = FALSE;
-		HANDLE hChannel = 0;
+		HANDLE hChannel = nullptr;
 		rdpContext* context = client->context;
 		rdpMcs* mcs = context->rdp->mcs;
-		rdpMcsChannel* mcsChannel = NULL;
 
-		for (index = 0; index < mcs->channelCount; index++)
+		for (UINT32 index = 0; index < mcs->channelCount; index++)
 		{
-			mcsChannel = &(mcs->channels[index]);
+			const rdpMcsChannel* mcsChannel = &(mcs->channels[index]);
 
 			if (mcsChannel->ChannelId == channelId)
 			{
@@ -191,14 +197,14 @@ BOOL freerdp_channel_peer_process(freerdp_peer* client, wStream* s, UINT16 chann
 		if (!found)
 			return FALSE;
 
-		rc = client->VirtualChannelRead(client, hChannel, Stream_Pointer(s), chunkLength);
+		rc = client->VirtualChannelRead(client, hChannel, Stream_Pointer(s), (UINT32)chunkLength);
 		if (rc < 0)
 			return FALSE;
 	}
 	else if (client->ReceiveChannelData)
 	{
-		BOOL rc = client->ReceiveChannelData(client, channelId, Stream_Pointer(s), chunkLength,
-		                                     flags, length);
+		BOOL rc = client->ReceiveChannelData(client, channelId, Stream_Pointer(s),
+		                                     (UINT32)chunkLength, flags, length);
 		if (!rc)
 			return FALSE;
 	}
@@ -292,22 +298,26 @@ const WtsApiFunctionTable* FreeRDP_InitWtsApi(void)
 BOOL freerdp_channel_send_packet(rdpRdp* rdp, UINT16 channelId, size_t totalSize, UINT32 flags,
                                  const BYTE* data, size_t chunkSize)
 {
-	wStream* s = rdp_send_stream_init(rdp);
+	if (totalSize > UINT32_MAX)
+		return FALSE;
+
+	UINT16 sec_flags = 0;
+	wStream* s = rdp_send_stream_init(rdp, &sec_flags);
 
 	if (!s)
 		return FALSE;
 
-	Stream_Write_UINT32(s, totalSize);
-	Stream_Write_UINT32(s, flags);
-
-	if (!Stream_EnsureCapacity(s, chunkSize))
+	if (!Stream_EnsureRemainingCapacity(s, chunkSize + 8ull))
 	{
 		Stream_Release(s);
 		return FALSE;
 	}
 
+	Stream_Write_UINT32(s, (UINT32)totalSize);
+	Stream_Write_UINT32(s, flags);
+
 	Stream_Write(s, data, chunkSize);
 
-	/* WLog_DBG(TAG, "%s: sending data (flags=0x%x size=%d)", __FUNCTION__, flags, size); */
-	return rdp_send(rdp, s, channelId);
+	/* WLog_DBG(TAG, "sending data (flags=0x%x size=%d)",  flags, size); */
+	return rdp_send(rdp, s, channelId, sec_flags);
 }

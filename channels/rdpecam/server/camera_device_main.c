@@ -17,10 +17,15 @@
  * limitations under the License.
  */
 
+#include <winpr/cast.h>
+
 #include <freerdp/config.h>
 
+#include <freerdp/freerdp.h>
 #include <freerdp/channels/log.h>
 #include <freerdp/server/rdpecam.h>
+
+#include "rdpecam-utils.h"
 
 #define TAG CHANNELS_TAG("rdpecam.server")
 
@@ -73,10 +78,10 @@ static UINT device_server_open_channel(device_server* device)
 {
 	CameraDeviceServerContext* context = &device->context;
 	DWORD Error = ERROR_SUCCESS;
-	HANDLE hEvent;
+	HANDLE hEvent = nullptr;
 	DWORD BytesReturned = 0;
-	PULONG pSessionId = NULL;
-	UINT32 channelId;
+	PULONG pSessionId = nullptr;
+	UINT32 channelId = 0;
 	BOOL status = TRUE;
 
 	WINPR_ASSERT(device);
@@ -120,10 +125,11 @@ static UINT device_server_open_channel(device_server* device)
 	return Error;
 }
 
-static UINT device_server_handle_success_response(CameraDeviceServerContext* context, wStream* s,
+static UINT device_server_handle_success_response(CameraDeviceServerContext* context,
+                                                  WINPR_ATTR_UNUSED wStream* s,
                                                   const CAM_SHARED_MSG_HEADER* header)
 {
-	CAM_SUCCESS_RESPONSE pdu = { 0 };
+	CAM_SUCCESS_RESPONSE pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
 
 	WINPR_ASSERT(context);
@@ -141,7 +147,7 @@ static UINT device_server_handle_success_response(CameraDeviceServerContext* con
 static UINT device_server_recv_error_response(CameraDeviceServerContext* context, wStream* s,
                                               const CAM_SHARED_MSG_HEADER* header)
 {
-	CAM_ERROR_RESPONSE pdu = { 0 };
+	CAM_ERROR_RESPONSE pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
 
 	WINPR_ASSERT(context);
@@ -152,7 +158,12 @@ static UINT device_server_recv_error_response(CameraDeviceServerContext* context
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 4))
 		return ERROR_NO_DATA;
 
-	Stream_Read_UINT32(s, pdu.ErrorCode);
+	{
+		const UINT32 val = Stream_Get_UINT32(s);
+		if (!rdpecam_valid_CamErrorCode(val))
+			return ERROR_INVALID_DATA;
+		pdu.ErrorCode = (CAM_ERROR_CODE)val;
+	}
 
 	IFCALLRET(context->ErrorResponse, error, context, &pdu);
 	if (error)
@@ -164,9 +175,8 @@ static UINT device_server_recv_error_response(CameraDeviceServerContext* context
 static UINT device_server_recv_stream_list_response(CameraDeviceServerContext* context, wStream* s,
                                                     const CAM_SHARED_MSG_HEADER* header)
 {
-	CAM_STREAM_LIST_RESPONSE pdu = { 0 };
+	CAM_STREAM_LIST_RESPONSE pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	BYTE i;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(header);
@@ -176,14 +186,27 @@ static UINT device_server_recv_stream_list_response(CameraDeviceServerContext* c
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 5))
 		return ERROR_NO_DATA;
 
-	pdu.N_Descriptions = MIN(Stream_GetRemainingLength(s) / 5, 255);
+	pdu.N_Descriptions = 255;
+	const size_t len = Stream_GetRemainingLength(s) / 5;
+	if (len < 255)
+		pdu.N_Descriptions = (BYTE)len;
 
-	for (i = 0; i < pdu.N_Descriptions; ++i)
+	for (BYTE i = 0; i < pdu.N_Descriptions; ++i)
 	{
 		CAM_STREAM_DESCRIPTION* StreamDescription = &pdu.StreamDescriptions[i];
 
-		Stream_Read_UINT16(s, StreamDescription->FrameSourceTypes);
-		Stream_Read_UINT8(s, StreamDescription->StreamCategory);
+		{
+			const UINT16 val = Stream_Get_UINT16(s);
+			if (!rdpecam_valid_CamStreamFrameSourceType(val))
+				return ERROR_INVALID_DATA;
+			StreamDescription->FrameSourceTypes = (CAM_STREAM_FRAME_SOURCE_TYPES)val;
+		}
+		{
+			const UINT8 val = Stream_Get_UINT8(s);
+			if (!rdpecam_valid_CamStreamCategory(val))
+				return ERROR_INVALID_DATA;
+			StreamDescription->StreamCategory = (CAM_STREAM_CATEGORY)val;
+		}
 		Stream_Read_UINT8(s, StreamDescription->Selected);
 		Stream_Read_UINT8(s, StreamDescription->CanBeShared);
 	}
@@ -199,9 +222,8 @@ static UINT device_server_recv_media_type_list_response(CameraDeviceServerContex
                                                         wStream* s,
                                                         const CAM_SHARED_MSG_HEADER* header)
 {
-	CAM_MEDIA_TYPE_LIST_RESPONSE pdu = { 0 };
+	CAM_MEDIA_TYPE_LIST_RESPONSE pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
-	BYTE i;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(header);
@@ -221,18 +243,34 @@ static UINT device_server_recv_media_type_list_response(CameraDeviceServerContex
 		return ERROR_NOT_ENOUGH_MEMORY;
 	}
 
-	for (i = 0; i < pdu.N_Descriptions; ++i)
+	for (size_t i = 0; i < pdu.N_Descriptions; ++i)
 	{
 		CAM_MEDIA_TYPE_DESCRIPTION* MediaTypeDescriptions = &pdu.MediaTypeDescriptions[i];
 
-		Stream_Read_UINT8(s, MediaTypeDescriptions->Format);
+		{
+			const UINT8 val = Stream_Get_UINT8(s);
+			if (!rdpecam_valid_CamMediaFormat(val))
+			{
+				free(pdu.MediaTypeDescriptions);
+				return ERROR_INVALID_DATA;
+			}
+			MediaTypeDescriptions->Format = (CAM_MEDIA_FORMAT)val;
+		}
 		Stream_Read_UINT32(s, MediaTypeDescriptions->Width);
 		Stream_Read_UINT32(s, MediaTypeDescriptions->Height);
 		Stream_Read_UINT32(s, MediaTypeDescriptions->FrameRateNumerator);
 		Stream_Read_UINT32(s, MediaTypeDescriptions->FrameRateDenominator);
 		Stream_Read_UINT32(s, MediaTypeDescriptions->PixelAspectRatioNumerator);
 		Stream_Read_UINT32(s, MediaTypeDescriptions->PixelAspectRatioDenominator);
-		Stream_Read_UINT8(s, MediaTypeDescriptions->Flags);
+		{
+			const UINT8 val = Stream_Get_UINT8(s);
+			if (!rdpecam_valid_MediaTypeDescriptionFlags(val))
+			{
+				free(pdu.MediaTypeDescriptions);
+				return ERROR_INVALID_DATA;
+			}
+			MediaTypeDescriptions->Flags = (CAM_MEDIA_TYPE_DESCRIPTION_FLAGS)val;
+		}
 	}
 
 	IFCALLRET(context->MediaTypeListResponse, error, context, &pdu);
@@ -248,7 +286,7 @@ static UINT device_server_recv_current_media_type_response(CameraDeviceServerCon
                                                            wStream* s,
                                                            const CAM_SHARED_MSG_HEADER* header)
 {
-	CAM_CURRENT_MEDIA_TYPE_RESPONSE pdu = { 0 };
+	CAM_CURRENT_MEDIA_TYPE_RESPONSE pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
 
 	WINPR_ASSERT(context);
@@ -259,14 +297,25 @@ static UINT device_server_recv_current_media_type_response(CameraDeviceServerCon
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 26))
 		return ERROR_NO_DATA;
 
-	Stream_Read_UINT8(s, pdu.MediaTypeDescription.Format);
+	{
+		const UINT8 val = Stream_Get_UINT8(s);
+		if (!rdpecam_valid_CamMediaFormat(val))
+			return ERROR_INVALID_DATA;
+		pdu.MediaTypeDescription.Format = (CAM_MEDIA_FORMAT)val;
+	}
+
 	Stream_Read_UINT32(s, pdu.MediaTypeDescription.Width);
 	Stream_Read_UINT32(s, pdu.MediaTypeDescription.Height);
 	Stream_Read_UINT32(s, pdu.MediaTypeDescription.FrameRateNumerator);
 	Stream_Read_UINT32(s, pdu.MediaTypeDescription.FrameRateDenominator);
 	Stream_Read_UINT32(s, pdu.MediaTypeDescription.PixelAspectRatioNumerator);
 	Stream_Read_UINT32(s, pdu.MediaTypeDescription.PixelAspectRatioDenominator);
-	Stream_Read_UINT8(s, pdu.MediaTypeDescription.Flags);
+	{
+		const UINT8 val = Stream_Get_UINT8(s);
+		if (!rdpecam_valid_MediaTypeDescriptionFlags(val))
+			return ERROR_INVALID_DATA;
+		pdu.MediaTypeDescription.Flags = (CAM_MEDIA_TYPE_DESCRIPTION_FLAGS)val;
+	}
 
 	IFCALLRET(context->CurrentMediaTypeResponse, error, context, &pdu);
 	if (error)
@@ -278,7 +327,7 @@ static UINT device_server_recv_current_media_type_response(CameraDeviceServerCon
 static UINT device_server_recv_sample_response(CameraDeviceServerContext* context, wStream* s,
                                                const CAM_SHARED_MSG_HEADER* header)
 {
-	CAM_SAMPLE_RESPONSE pdu = { 0 };
+	CAM_SAMPLE_RESPONSE pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
 
 	WINPR_ASSERT(context);
@@ -304,7 +353,7 @@ static UINT device_server_recv_sample_response(CameraDeviceServerContext* contex
 static UINT device_server_recv_sample_error_response(CameraDeviceServerContext* context, wStream* s,
                                                      const CAM_SHARED_MSG_HEADER* header)
 {
-	CAM_SAMPLE_ERROR_RESPONSE pdu = { 0 };
+	CAM_SAMPLE_ERROR_RESPONSE pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
 
 	WINPR_ASSERT(context);
@@ -316,7 +365,12 @@ static UINT device_server_recv_sample_error_response(CameraDeviceServerContext* 
 		return ERROR_NO_DATA;
 
 	Stream_Read_UINT8(s, pdu.StreamIndex);
-	Stream_Read_UINT32(s, pdu.ErrorCode);
+	{
+		const UINT32 val = Stream_Get_UINT32(s);
+		if (!rdpecam_valid_CamErrorCode(val))
+			return ERROR_INVALID_DATA;
+		pdu.ErrorCode = (CAM_ERROR_CODE)val;
+	}
 
 	IFCALLRET(context->SampleErrorResponse, error, context, &pdu);
 	if (error)
@@ -329,8 +383,8 @@ static UINT device_server_recv_property_list_response(CameraDeviceServerContext*
                                                       wStream* s,
                                                       const CAM_SHARED_MSG_HEADER* header)
 {
-	CAM_PROPERTY_LIST_RESPONSE pdu = { 0 };
-	UINT error = CHANNEL_RC_OK;
+	CAM_PROPERTY_LIST_RESPONSE pdu = WINPR_C_ARRAY_INIT;
+	UINT error = ERROR_INVALID_DATA;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(header);
@@ -341,8 +395,6 @@ static UINT device_server_recv_property_list_response(CameraDeviceServerContext*
 
 	if (pdu.N_Properties > 0)
 	{
-		size_t i;
-
 		pdu.Properties = calloc(pdu.N_Properties, sizeof(CAM_PROPERTY_DESCRIPTION));
 		if (!pdu.Properties)
 		{
@@ -351,19 +403,29 @@ static UINT device_server_recv_property_list_response(CameraDeviceServerContext*
 			return ERROR_NOT_ENOUGH_MEMORY;
 		}
 
-		for (i = 0; i < pdu.N_Properties; ++i)
+		for (size_t i = 0; i < pdu.N_Properties; ++i)
 		{
-			Stream_Read_UINT8(s, pdu.Properties[i].PropertySet);
-			Stream_Read_UINT8(s, pdu.Properties[i].PropertyId);
-			Stream_Read_UINT8(s, pdu.Properties[i].Capabilities);
-			Stream_Read_INT32(s, pdu.Properties[i].MinValue);
-			Stream_Read_INT32(s, pdu.Properties[i].MaxValue);
-			Stream_Read_INT32(s, pdu.Properties[i].Step);
-			Stream_Read_INT32(s, pdu.Properties[i].DefaultValue);
+			CAM_PROPERTY_DESCRIPTION* cur = &pdu.Properties[i];
+			{
+				const UINT8 val = Stream_Get_UINT8(s);
+				if (!rdpecam_valid_CamPropertySet(val))
+					goto fail;
+				cur->PropertySet = (CAM_PROPERTY_SET)val;
+			}
+			cur->PropertyId = Stream_Get_UINT8(s);
+			cur->Capabilities = Stream_Get_UINT8(s);
+			if (!rdpecam_valid_CamPropertyCapabilities(cur->Capabilities))
+				goto fail;
+			cur->MinValue = Stream_Get_INT32(s);
+			cur->MaxValue = Stream_Get_INT32(s);
+			cur->Step = Stream_Get_INT32(s);
+			cur->DefaultValue = Stream_Get_INT32(s);
 		}
 	}
 
-	IFCALLRET(context->PropertyListResponse, error, context, &pdu);
+	error = IFCALLRESULT(CHANNEL_RC_OK, context->PropertyListResponse, context, &pdu);
+
+fail:
 	if (error)
 		WLog_ERR(TAG, "context->PropertyListResponse failed with error %" PRIu32 "", error);
 
@@ -376,7 +438,7 @@ static UINT device_server_recv_property_value_response(CameraDeviceServerContext
                                                        wStream* s,
                                                        const CAM_SHARED_MSG_HEADER* header)
 {
-	CAM_PROPERTY_VALUE_RESPONSE pdu = { 0 };
+	CAM_PROPERTY_VALUE_RESPONSE pdu = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
 
 	WINPR_ASSERT(context);
@@ -387,7 +449,13 @@ static UINT device_server_recv_property_value_response(CameraDeviceServerContext
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 5))
 		return ERROR_NO_DATA;
 
-	Stream_Read_UINT8(s, pdu.PropertyValue.Mode);
+	{
+		const UINT8 val = Stream_Get_UINT8(s);
+		if (!rdpecam_valid_CamPropertyMode(val))
+			return ERROR_INVALID_DATA;
+		pdu.PropertyValue.Mode = (CAM_PROPERTY_MODE)val;
+	}
+
 	Stream_Read_INT32(s, pdu.PropertyValue.Value);
 
 	IFCALLRET(context->PropertyValueResponse, error, context, &pdu);
@@ -399,11 +467,11 @@ static UINT device_server_recv_property_value_response(CameraDeviceServerContext
 
 static UINT device_process_message(device_server* device)
 {
-	BOOL rc;
+	BOOL rc = 0;
 	UINT error = ERROR_INTERNAL_ERROR;
-	ULONG BytesReturned;
-	CAM_SHARED_MSG_HEADER header = { 0 };
-	wStream* s;
+	ULONG BytesReturned = 0;
+	CAM_SHARED_MSG_HEADER header = WINPR_C_ARRAY_INIT;
+	wStream* s = nullptr;
 
 	WINPR_ASSERT(device);
 	WINPR_ASSERT(device->device_channel);
@@ -411,8 +479,8 @@ static UINT device_process_message(device_server* device)
 	s = device->buffer;
 	WINPR_ASSERT(s);
 
-	Stream_SetPosition(s, 0);
-	rc = WTSVirtualChannelRead(device->device_channel, 0, NULL, 0, &BytesReturned);
+	Stream_ResetPosition(s);
+	rc = WTSVirtualChannelRead(device->device_channel, 0, nullptr, 0, &BytesReturned);
 	if (!rc)
 		goto out;
 
@@ -429,19 +497,26 @@ static UINT device_process_message(device_server* device)
 		goto out;
 	}
 
-	if (WTSVirtualChannelRead(device->device_channel, 0, (PCHAR)Stream_Buffer(s),
+	if (WTSVirtualChannelRead(device->device_channel, 0, Stream_BufferAs(s, char),
 	                          (ULONG)Stream_Capacity(s), &BytesReturned) == FALSE)
 	{
 		WLog_ERR(TAG, "WTSVirtualChannelRead failed!");
 		goto out;
 	}
 
-	Stream_SetLength(s, BytesReturned);
+	if (!Stream_SetLength(s, BytesReturned))
+		goto out;
+
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, CAM_HEADER_SIZE))
 		return ERROR_NO_DATA;
 
 	Stream_Read_UINT8(s, header.Version);
-	Stream_Read_UINT8(s, header.MessageId);
+	{
+		const UINT8 id = Stream_Get_UINT8(s);
+		if (!rdpecam_valid_messageId(id))
+			return ERROR_INVALID_DATA;
+		header.MessageId = (CAM_MSG_ID)id;
+	}
 
 	switch (header.MessageId)
 	{
@@ -504,6 +579,8 @@ static UINT device_server_context_poll_int(CameraDeviceServerContext* context)
 		case CAMERA_DEVICE_OPENED:
 			error = device_process_message(device);
 			break;
+		default:
+			break;
 	}
 
 	return error;
@@ -511,9 +588,9 @@ static UINT device_server_context_poll_int(CameraDeviceServerContext* context)
 
 static HANDLE device_server_get_channel_handle(device_server* device)
 {
-	void* buffer = NULL;
+	void* buffer = nullptr;
 	DWORD BytesReturned = 0;
-	HANDLE ChannelEvent = NULL;
+	HANDLE ChannelEvent = nullptr;
 
 	WINPR_ASSERT(device);
 
@@ -521,7 +598,7 @@ static HANDLE device_server_get_channel_handle(device_server* device)
 	                           &BytesReturned) == TRUE)
 	{
 		if (BytesReturned == sizeof(HANDLE))
-			CopyMemory(&ChannelEvent, buffer, sizeof(HANDLE));
+			ChannelEvent = *(HANDLE*)buffer;
 
 		WTSFreeMemory(buffer);
 	}
@@ -531,11 +608,11 @@ static HANDLE device_server_get_channel_handle(device_server* device)
 
 static DWORD WINAPI device_server_thread_func(LPVOID arg)
 {
-	DWORD nCount;
-	HANDLE events[2] = { 0 };
+	DWORD nCount = 0;
+	HANDLE events[2] = WINPR_C_ARRAY_INIT;
 	device_server* device = (device_server*)arg;
 	UINT error = CHANNEL_RC_OK;
-	DWORD status;
+	DWORD status = 0;
 
 	WINPR_ASSERT(device);
 
@@ -571,11 +648,13 @@ static DWORD WINAPI device_server_thread_func(LPVOID arg)
 						break;
 				}
 				break;
+			default:
+				break;
 		}
 	}
 
-	WTSVirtualChannelClose(device->device_channel);
-	device->device_channel = NULL;
+	(void)WTSVirtualChannelClose(device->device_channel);
+	device->device_channel = nullptr;
 
 	if (error && device->context.rdpcontext)
 		setChannelError(device->context.rdpcontext, error,
@@ -591,21 +670,21 @@ static UINT device_server_open(CameraDeviceServerContext* context)
 
 	WINPR_ASSERT(device);
 
-	if (!device->externalThread && (device->thread == NULL))
+	if (!device->externalThread && (device->thread == nullptr))
 	{
-		device->stopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+		device->stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
 		if (!device->stopEvent)
 		{
 			WLog_ERR(TAG, "CreateEvent failed!");
 			return ERROR_INTERNAL_ERROR;
 		}
 
-		device->thread = CreateThread(NULL, 0, device_server_thread_func, device, 0, NULL);
+		device->thread = CreateThread(nullptr, 0, device_server_thread_func, device, 0, nullptr);
 		if (!device->thread)
 		{
 			WLog_ERR(TAG, "CreateThread failed!");
-			CloseHandle(device->stopEvent);
-			device->stopEvent = NULL;
+			(void)CloseHandle(device->stopEvent);
+			device->stopEvent = nullptr;
 			return ERROR_INTERNAL_ERROR;
 		}
 	}
@@ -623,7 +702,7 @@ static UINT device_server_close(CameraDeviceServerContext* context)
 
 	if (!device->externalThread && device->thread)
 	{
-		SetEvent(device->stopEvent);
+		(void)SetEvent(device->stopEvent);
 
 		if (WaitForSingleObject(device->thread, INFINITE) == WAIT_FAILED)
 		{
@@ -632,17 +711,17 @@ static UINT device_server_close(CameraDeviceServerContext* context)
 			return error;
 		}
 
-		CloseHandle(device->thread);
-		CloseHandle(device->stopEvent);
-		device->thread = NULL;
-		device->stopEvent = NULL;
+		(void)CloseHandle(device->thread);
+		(void)CloseHandle(device->stopEvent);
+		device->thread = nullptr;
+		device->stopEvent = nullptr;
 	}
 	if (device->externalThread)
 	{
 		if (device->state != CAMERA_DEVICE_INITIAL)
 		{
-			WTSVirtualChannelClose(device->device_channel);
-			device->device_channel = NULL;
+			(void)WTSVirtualChannelClose(device->device_channel);
+			device->device_channel = nullptr;
 			device->state = CAMERA_DEVICE_INITIAL;
 		}
 	}
@@ -682,16 +761,14 @@ static BOOL device_server_context_handle(CameraDeviceServerContext* context, HAN
 
 static wStream* device_server_packet_new(size_t size, BYTE version, BYTE messageId)
 {
-	wStream* s;
-
-	WINPR_ASSERT(size > 0);
+	wStream* s = nullptr;
 
 	/* Allocate what we need plus header bytes */
-	s = Stream_New(NULL, size + CAM_HEADER_SIZE);
+	s = Stream_New(nullptr, size + CAM_HEADER_SIZE);
 	if (!s)
 	{
 		WLog_ERR(TAG, "Stream_New failed!");
-		return NULL;
+		return nullptr;
 	}
 
 	Stream_Write_UINT8(s, version);
@@ -704,13 +781,15 @@ static UINT device_server_packet_send(CameraDeviceServerContext* context, wStrea
 {
 	device_server* device = (device_server*)context;
 	UINT error = CHANNEL_RC_OK;
-	ULONG written;
+	ULONG written = 0;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(s);
 
-	if (!WTSVirtualChannelWrite(device->device_channel, (PCHAR)Stream_Buffer(s),
-	                            Stream_GetPosition(s), &written))
+	const size_t len = Stream_GetPosition(s);
+	WINPR_ASSERT(len <= UINT32_MAX);
+	if (!WTSVirtualChannelWrite(device->device_channel, Stream_BufferAs(s, char), (UINT32)len,
+	                            &written))
 	{
 		WLog_ERR(TAG, "WTSVirtualChannelWrite failed!");
 		error = ERROR_INTERNAL_ERROR;
@@ -730,7 +809,7 @@ out:
 
 static UINT device_server_write_and_send_header(CameraDeviceServerContext* context, BYTE messageId)
 {
-	wStream* s;
+	wStream* s = nullptr;
 
 	WINPR_ASSERT(context);
 
@@ -741,9 +820,9 @@ static UINT device_server_write_and_send_header(CameraDeviceServerContext* conte
 	return device_server_packet_send(context, s);
 }
 
-static UINT
-device_send_activate_device_request_pdu(CameraDeviceServerContext* context,
-                                        const CAM_ACTIVATE_DEVICE_REQUEST* activateDeviceRequest)
+static UINT device_send_activate_device_request_pdu(
+    CameraDeviceServerContext* context,
+    WINPR_ATTR_UNUSED const CAM_ACTIVATE_DEVICE_REQUEST* activateDeviceRequest)
 {
 	WINPR_ASSERT(context);
 
@@ -752,15 +831,16 @@ device_send_activate_device_request_pdu(CameraDeviceServerContext* context,
 
 static UINT device_send_deactivate_device_request_pdu(
     CameraDeviceServerContext* context,
-    const CAM_DEACTIVATE_DEVICE_REQUEST* deactivateDeviceRequest)
+    WINPR_ATTR_UNUSED const CAM_DEACTIVATE_DEVICE_REQUEST* deactivateDeviceRequest)
 {
 	WINPR_ASSERT(context);
 
 	return device_server_write_and_send_header(context, CAM_MSG_ID_DeactivateDeviceRequest);
 }
 
-static UINT device_send_stream_list_request_pdu(CameraDeviceServerContext* context,
-                                                const CAM_STREAM_LIST_REQUEST* streamListRequest)
+static UINT device_send_stream_list_request_pdu(
+    CameraDeviceServerContext* context,
+    WINPR_ATTR_UNUSED const CAM_STREAM_LIST_REQUEST* streamListRequest)
 {
 	WINPR_ASSERT(context);
 
@@ -771,7 +851,7 @@ static UINT
 device_send_media_type_list_request_pdu(CameraDeviceServerContext* context,
                                         const CAM_MEDIA_TYPE_LIST_REQUEST* mediaTypeListRequest)
 {
-	wStream* s;
+	wStream* s = nullptr;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(mediaTypeListRequest);
@@ -789,7 +869,7 @@ static UINT device_send_current_media_type_request_pdu(
     CameraDeviceServerContext* context,
     const CAM_CURRENT_MEDIA_TYPE_REQUEST* currentMediaTypeRequest)
 {
-	wStream* s;
+	wStream* s = nullptr;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(currentMediaTypeRequest);
@@ -807,8 +887,7 @@ static UINT
 device_send_start_streams_request_pdu(CameraDeviceServerContext* context,
                                       const CAM_START_STREAMS_REQUEST* startStreamsRequest)
 {
-	wStream* s;
-	size_t i;
+	wStream* s = nullptr;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(startStreamsRequest);
@@ -818,28 +897,29 @@ device_send_start_streams_request_pdu(CameraDeviceServerContext* context,
 	if (!s)
 		return ERROR_NOT_ENOUGH_MEMORY;
 
-	for (i = 0; i < startStreamsRequest->N_Infos; ++i)
+	for (size_t i = 0; i < startStreamsRequest->N_Infos; ++i)
 	{
 		const CAM_START_STREAM_INFO* info = &startStreamsRequest->StartStreamsInfo[i];
 		const CAM_MEDIA_TYPE_DESCRIPTION* description = &info->MediaTypeDescription;
 
 		Stream_Write_UINT8(s, info->StreamIndex);
 
-		Stream_Write_UINT8(s, description->Format);
+		Stream_Write_UINT8(s, WINPR_ASSERTING_INT_CAST(uint8_t, description->Format));
 		Stream_Write_UINT32(s, description->Width);
 		Stream_Write_UINT32(s, description->Height);
 		Stream_Write_UINT32(s, description->FrameRateNumerator);
 		Stream_Write_UINT32(s, description->FrameRateDenominator);
 		Stream_Write_UINT32(s, description->PixelAspectRatioNumerator);
 		Stream_Write_UINT32(s, description->PixelAspectRatioDenominator);
-		Stream_Write_UINT8(s, description->Flags);
+		Stream_Write_UINT8(s, WINPR_ASSERTING_INT_CAST(uint8_t, description->Flags));
 	}
 
 	return device_server_packet_send(context, s);
 }
 
-static UINT device_send_stop_streams_request_pdu(CameraDeviceServerContext* context,
-                                                 const CAM_STOP_STREAMS_REQUEST* stopStreamsRequest)
+static UINT device_send_stop_streams_request_pdu(
+    CameraDeviceServerContext* context,
+    WINPR_ATTR_UNUSED const CAM_STOP_STREAMS_REQUEST* stopStreamsRequest)
 {
 	WINPR_ASSERT(context);
 
@@ -849,7 +929,7 @@ static UINT device_send_stop_streams_request_pdu(CameraDeviceServerContext* cont
 static UINT device_send_sample_request_pdu(CameraDeviceServerContext* context,
                                            const CAM_SAMPLE_REQUEST* sampleRequest)
 {
-	wStream* s;
+	wStream* s = nullptr;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(sampleRequest);
@@ -863,9 +943,9 @@ static UINT device_send_sample_request_pdu(CameraDeviceServerContext* context,
 	return device_server_packet_send(context, s);
 }
 
-static UINT
-device_send_property_list_request_pdu(CameraDeviceServerContext* context,
-                                      const CAM_PROPERTY_LIST_REQUEST* propertyListRequest)
+static UINT device_send_property_list_request_pdu(
+    CameraDeviceServerContext* context,
+    WINPR_ATTR_UNUSED const CAM_PROPERTY_LIST_REQUEST* propertyListRequest)
 {
 	WINPR_ASSERT(context);
 
@@ -876,7 +956,7 @@ static UINT
 device_send_property_value_request_pdu(CameraDeviceServerContext* context,
                                        const CAM_PROPERTY_VALUE_REQUEST* propertyValueRequest)
 {
-	wStream* s;
+	wStream* s = nullptr;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(propertyValueRequest);
@@ -885,7 +965,7 @@ device_send_property_value_request_pdu(CameraDeviceServerContext* context,
 	if (!s)
 		return ERROR_NOT_ENOUGH_MEMORY;
 
-	Stream_Write_UINT8(s, propertyValueRequest->PropertySet);
+	Stream_Write_UINT8(s, WINPR_ASSERTING_INT_CAST(uint8_t, propertyValueRequest->PropertySet));
 	Stream_Write_UINT8(s, propertyValueRequest->PropertyId);
 
 	return device_server_packet_send(context, s);
@@ -895,7 +975,7 @@ static UINT device_send_set_property_value_request_pdu(
     CameraDeviceServerContext* context,
     const CAM_SET_PROPERTY_VALUE_REQUEST* setPropertyValueRequest)
 {
-	wStream* s;
+	wStream* s = nullptr;
 
 	WINPR_ASSERT(context);
 	WINPR_ASSERT(setPropertyValueRequest);
@@ -905,10 +985,11 @@ static UINT device_send_set_property_value_request_pdu(
 	if (!s)
 		return ERROR_NOT_ENOUGH_MEMORY;
 
-	Stream_Write_UINT8(s, setPropertyValueRequest->PropertySet);
+	Stream_Write_UINT8(s, WINPR_ASSERTING_INT_CAST(uint8_t, setPropertyValueRequest->PropertySet));
 	Stream_Write_UINT8(s, setPropertyValueRequest->PropertyId);
 
-	Stream_Write_UINT8(s, setPropertyValueRequest->PropertyValue.Mode);
+	Stream_Write_UINT8(
+	    s, WINPR_ASSERTING_INT_CAST(uint8_t, setPropertyValueRequest->PropertyValue.Mode));
 	Stream_Write_INT32(s, setPropertyValueRequest->PropertyValue.Value);
 
 	return device_server_packet_send(context, s);
@@ -919,7 +1000,7 @@ CameraDeviceServerContext* camera_device_server_context_new(HANDLE vcm)
 	device_server* device = (device_server*)calloc(1, sizeof(device_server));
 
 	if (!device)
-		return NULL;
+		return nullptr;
 
 	device->context.vcm = vcm;
 	device->context.Initialize = device_server_initialize;
@@ -943,14 +1024,17 @@ CameraDeviceServerContext* camera_device_server_context_new(HANDLE vcm)
 	device->context.PropertyValueRequest = device_send_property_value_request_pdu;
 	device->context.SetPropertyValueRequest = device_send_set_property_value_request_pdu;
 
-	device->buffer = Stream_New(NULL, 4096);
+	device->buffer = Stream_New(nullptr, 4096);
 	if (!device->buffer)
 		goto fail;
 
 	return &device->context;
 fail:
+	WINPR_PRAGMA_DIAG_PUSH
+	WINPR_PRAGMA_DIAG_IGNORED_MISMATCHED_DEALLOC
 	camera_device_server_context_free(&device->context);
-	return NULL;
+	WINPR_PRAGMA_DIAG_POP
+	return nullptr;
 }
 
 void camera_device_server_context_free(CameraDeviceServerContext* context)

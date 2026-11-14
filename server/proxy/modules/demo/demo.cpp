@@ -21,6 +21,8 @@
 
 #include <iostream>
 
+#include <freerdp/api.h>
+#include <freerdp/scancode.h>
 #include <freerdp/server/proxy/proxy_modules_api.h>
 
 #define TAG MODULE_TAG("demo")
@@ -34,7 +36,8 @@ struct demo_custom_data
 static constexpr char plugin_name[] = "demo";
 static constexpr char plugin_desc[] = "this is a test plugin";
 
-static BOOL demo_plugin_unload(proxyPlugin* plugin)
+[[nodiscard]]
+static BOOL demo_plugin_unload([[maybe_unused]] proxyPlugin* plugin)
 {
 	WINPR_ASSERT(plugin);
 
@@ -47,149 +50,192 @@ static BOOL demo_plugin_unload(proxyPlugin* plugin)
 	return TRUE;
 }
 
-static BOOL demo_client_init_connect(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_client_init_connect([[maybe_unused]] proxyPlugin* plugin,
+                                     [[maybe_unused]] proxyData* pdata,
+                                     [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_client_uninit_connect(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_client_uninit_connect([[maybe_unused]] proxyPlugin* plugin,
+                                       [[maybe_unused]] proxyData* pdata,
+                                       [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_client_pre_connect(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_client_pre_connect([[maybe_unused]] proxyPlugin* plugin,
+                                    [[maybe_unused]] proxyData* pdata,
+                                    [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_client_post_connect(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_client_post_connect([[maybe_unused]] proxyPlugin* plugin,
+                                     [[maybe_unused]] proxyData* pdata,
+                                     [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_client_post_disconnect(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_client_post_disconnect([[maybe_unused]] proxyPlugin* plugin,
+                                        [[maybe_unused]] proxyData* pdata,
+                                        [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_client_x509_certificate(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_client_x509_certificate([[maybe_unused]] proxyPlugin* plugin,
+                                         [[maybe_unused]] proxyData* pdata,
+                                         [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_client_login_failure(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_client_login_failure([[maybe_unused]] proxyPlugin* plugin,
+                                      [[maybe_unused]] proxyData* pdata,
+                                      [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_client_end_paint(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_client_end_paint([[maybe_unused]] proxyPlugin* plugin,
+                                  [[maybe_unused]] proxyData* pdata, [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_client_redirect(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_client_redirect([[maybe_unused]] proxyPlugin* plugin,
+                                 [[maybe_unused]] proxyData* pdata, [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_server_post_connect(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_server_post_connect([[maybe_unused]] proxyPlugin* plugin,
+                                     [[maybe_unused]] proxyData* pdata,
+                                     [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_server_peer_activate(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_server_peer_activate([[maybe_unused]] proxyPlugin* plugin,
+                                      [[maybe_unused]] proxyData* pdata,
+                                      [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_server_channels_init(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_server_channels_init([[maybe_unused]] proxyPlugin* plugin,
+                                      [[maybe_unused]] proxyData* pdata,
+                                      [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_server_channels_free(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_server_channels_free([[maybe_unused]] proxyPlugin* plugin,
+                                      [[maybe_unused]] proxyData* pdata,
+                                      [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_server_session_end(proxyPlugin* plugin, proxyData* pdata, void* custom)
+[[nodiscard]]
+static BOOL demo_server_session_end([[maybe_unused]] proxyPlugin* plugin,
+                                    [[maybe_unused]] proxyData* pdata,
+                                    [[maybe_unused]] void* custom)
 {
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(custom);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called");
 	return TRUE;
 }
 
-static BOOL demo_filter_keyboard_event(proxyPlugin* plugin, proxyData* pdata, void* param)
+[[nodiscard]]
+static BOOL demo_filter_keyboard_event([[maybe_unused]] proxyPlugin* plugin,
+                                       [[maybe_unused]] proxyData* pdata,
+                                       [[maybe_unused]] void* param)
 {
-	proxyPluginsManager* mgr;
+	proxyPluginsManager* mgr = nullptr;
 	auto event_data = static_cast<const proxyKeyboardEventInfo*>(param);
 
 	WINPR_ASSERT(plugin);
@@ -212,7 +258,37 @@ static BOOL demo_filter_keyboard_event(proxyPlugin* plugin, proxyData* pdata, vo
 	return TRUE;
 }
 
-static BOOL demo_mouse_event(proxyPlugin* plugin, proxyData* pdata, void* param)
+[[nodiscard]]
+static BOOL demo_filter_unicode_event([[maybe_unused]] proxyPlugin* plugin,
+                                      [[maybe_unused]] proxyData* pdata,
+                                      [[maybe_unused]] void* param)
+{
+	proxyPluginsManager* mgr = nullptr;
+	auto event_data = static_cast<const proxyUnicodeEventInfo*>(param);
+
+	WINPR_ASSERT(plugin);
+	WINPR_ASSERT(pdata);
+	WINPR_ASSERT(event_data);
+
+	mgr = plugin->mgr;
+	WINPR_ASSERT(mgr);
+
+	if (event_data == nullptr)
+		return FALSE;
+
+	if (event_data->code == 'b')
+	{
+		/* user typed 'B', that means bye :) */
+		std::cout << "C++ demo plugin: aborting connection" << std::endl;
+		mgr->AbortConnect(mgr, pdata);
+	}
+
+	return TRUE;
+}
+
+[[nodiscard]]
+static BOOL demo_mouse_event([[maybe_unused]] proxyPlugin* plugin,
+                             [[maybe_unused]] proxyData* pdata, [[maybe_unused]] void* param)
 {
 	auto event_data = static_cast<const proxyMouseEventInfo*>(param);
 
@@ -220,50 +296,75 @@ static BOOL demo_mouse_event(proxyPlugin* plugin, proxyData* pdata, void* param)
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(event_data);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called %p", WINPR_CXX_COMPAT_CAST(const void*, event_data));
 	return TRUE;
 }
 
-static BOOL demo_client_channel_data(proxyPlugin* plugin, proxyData* pdata, void* param)
+[[nodiscard]]
+static BOOL demo_mouse_ex_event([[maybe_unused]] proxyPlugin* plugin,
+                                [[maybe_unused]] proxyData* pdata, [[maybe_unused]] void* param)
 {
-	const proxyChannelDataEventInfo* channel = static_cast<const proxyChannelDataEventInfo*>(param);
+	auto event_data = static_cast<const proxyMouseExEventInfo*>(param);
+
+	WINPR_ASSERT(plugin);
+	WINPR_ASSERT(pdata);
+	WINPR_ASSERT(event_data);
+
+	WLog_INFO(TAG, "called %p", WINPR_CXX_COMPAT_CAST(const void*, event_data));
+	return TRUE;
+}
+
+[[nodiscard]]
+static BOOL demo_client_channel_data([[maybe_unused]] proxyPlugin* plugin,
+                                     [[maybe_unused]] proxyData* pdata,
+                                     [[maybe_unused]] void* param)
+{
+	const auto* channel = static_cast<const proxyChannelDataEventInfo*>(param);
 
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(channel);
 
-	WLog_INFO(TAG, "%s: %s [0x%04" PRIx16 "] got %" PRIuz, __FUNCTION__, channel->channel_name,
-	          channel->channel_id, channel->data_len);
+	WLog_INFO(TAG, "%s [0x%04" PRIx16 "] got %" PRIuz, channel->channel_name, channel->channel_id,
+	          channel->data_len);
 	return TRUE;
 }
 
-static BOOL demo_server_channel_data(proxyPlugin* plugin, proxyData* pdata, void* param)
+[[nodiscard]]
+static BOOL demo_server_channel_data([[maybe_unused]] proxyPlugin* plugin,
+                                     [[maybe_unused]] proxyData* pdata,
+                                     [[maybe_unused]] void* param)
 {
-	const proxyChannelDataEventInfo* channel = static_cast<const proxyChannelDataEventInfo*>(param);
+	const auto* channel = static_cast<const proxyChannelDataEventInfo*>(param);
 
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(channel);
 
-	WLog_WARN(TAG, "%s: %s [0x%04" PRIx16 "] got %" PRIuz, __FUNCTION__, channel->channel_name,
-	          channel->channel_id, channel->data_len);
+	WLog_WARN(TAG, "%s [0x%04" PRIx16 "] got %" PRIuz, channel->channel_name, channel->channel_id,
+	          channel->data_len);
 	return TRUE;
 }
 
-static BOOL demo_dynamic_channel_create(proxyPlugin* plugin, proxyData* pdata, void* param)
+[[nodiscard]]
+static BOOL demo_dynamic_channel_create([[maybe_unused]] proxyPlugin* plugin,
+                                        [[maybe_unused]] proxyData* pdata,
+                                        [[maybe_unused]] void* param)
 {
-	const proxyChannelDataEventInfo* channel = static_cast<const proxyChannelDataEventInfo*>(param);
+	const auto* channel = static_cast<const proxyChannelDataEventInfo*>(param);
 
 	WINPR_ASSERT(plugin);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(channel);
 
-	WLog_WARN(TAG, "%s: %s [0x%04" PRIx16 "]", __FUNCTION__, channel->channel_name,
-	          channel->channel_id);
+	WLog_WARN(TAG, "%s [0x%04" PRIx16 "]", channel->channel_name, channel->channel_id);
 	return TRUE;
 }
 
-static BOOL demo_server_fetch_target_addr(proxyPlugin* plugin, proxyData* pdata, void* param)
+[[nodiscard]]
+static BOOL demo_server_fetch_target_addr([[maybe_unused]] proxyPlugin* plugin,
+                                          [[maybe_unused]] proxyData* pdata,
+                                          [[maybe_unused]] void* param)
 {
 	auto event_data = static_cast<const proxyFetchTargetEventInfo*>(param);
 
@@ -271,11 +372,13 @@ static BOOL demo_server_fetch_target_addr(proxyPlugin* plugin, proxyData* pdata,
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(event_data);
 
-	WLog_INFO(TAG, "%s", __FUNCTION__);
+	WLog_INFO(TAG, "called %p", WINPR_CXX_COMPAT_CAST(const void*, event_data));
 	return TRUE;
 }
 
-static BOOL demo_server_peer_logon(proxyPlugin* plugin, proxyData* pdata, void* param)
+[[nodiscard]]
+static BOOL demo_server_peer_logon([[maybe_unused]] proxyPlugin* plugin,
+                                   [[maybe_unused]] proxyData* pdata, [[maybe_unused]] void* param)
 {
 	auto info = static_cast<const proxyServerPeerLogon*>(param);
 	WINPR_ASSERT(plugin);
@@ -283,22 +386,59 @@ static BOOL demo_server_peer_logon(proxyPlugin* plugin, proxyData* pdata, void* 
 	WINPR_ASSERT(info);
 	WINPR_ASSERT(info->identity);
 
-	WLog_INFO(TAG, "%s: %d", __FUNCTION__, info->automatic);
+	WLog_INFO(TAG, "%d", info->automatic);
 	return TRUE;
 }
 
-#ifdef __cplusplus
-extern "C"
+[[nodiscard]]
+static BOOL demo_dyn_channel_intercept_list([[maybe_unused]] proxyPlugin* plugin,
+                                            [[maybe_unused]] proxyData* pdata,
+                                            [[maybe_unused]] void* arg)
 {
-#endif
-	FREERDP_API BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata);
-#ifdef __cplusplus
-}
-#endif
+	auto data = static_cast<proxyChannelToInterceptData*>(arg);
 
-BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
+	WINPR_ASSERT(plugin);
+	WINPR_ASSERT(pdata);
+	WINPR_ASSERT(data);
+
+	WLog_INFO(TAG, "%s: %p", __func__, WINPR_CXX_COMPAT_CAST(const void*, data));
+	return TRUE;
+}
+
+[[nodiscard]]
+static BOOL demo_static_channel_intercept_list([[maybe_unused]] proxyPlugin* plugin,
+                                               [[maybe_unused]] proxyData* pdata,
+                                               [[maybe_unused]] void* arg)
 {
-	struct demo_custom_data* custom;
+	auto data = static_cast<proxyChannelToInterceptData*>(arg);
+
+	WINPR_ASSERT(plugin);
+	WINPR_ASSERT(pdata);
+	WINPR_ASSERT(data);
+
+	WLog_INFO(TAG, "%s: %p", __func__, WINPR_CXX_COMPAT_CAST(const void*, data));
+	return TRUE;
+}
+
+[[nodiscard]]
+static BOOL demo_dyn_channel_intercept([[maybe_unused]] proxyPlugin* plugin,
+                                       [[maybe_unused]] proxyData* pdata,
+                                       [[maybe_unused]] void* arg)
+{
+	auto data = static_cast<proxyDynChannelInterceptData*>(arg);
+
+	WINPR_ASSERT(plugin);
+	WINPR_ASSERT(pdata);
+	WINPR_ASSERT(data);
+
+	WLog_INFO(TAG, "%s: %p", __func__, WINPR_CXX_COMPAT_CAST(const void*, data));
+	return TRUE;
+}
+
+[[nodiscard]]
+static BOOL int_proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
+{
+	struct demo_custom_data* custom = nullptr;
 	proxyPlugin plugin = {};
 
 	plugin.name = plugin_name;
@@ -319,12 +459,19 @@ BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userda
 	plugin.ServerChannelsFree = demo_server_channels_free;
 	plugin.ServerSessionEnd = demo_server_session_end;
 	plugin.KeyboardEvent = demo_filter_keyboard_event;
+	plugin.UnicodeEvent = demo_filter_unicode_event;
 	plugin.MouseEvent = demo_mouse_event;
+	plugin.MouseExEvent = demo_mouse_ex_event;
 	plugin.ClientChannelData = demo_client_channel_data;
 	plugin.ServerChannelData = demo_server_channel_data;
 	plugin.DynamicChannelCreate = demo_dynamic_channel_create;
 	plugin.ServerFetchTargetAddr = demo_server_fetch_target_addr;
 	plugin.ServerPeerLogon = demo_server_peer_logon;
+
+	plugin.StaticChannelToIntercept = demo_static_channel_intercept_list;
+	plugin.DynChannelToIntercept = demo_dyn_channel_intercept_list;
+	plugin.DynChannelIntercept = demo_dyn_channel_intercept;
+
 	plugin.userdata = userdata;
 
 	custom = new (struct demo_custom_data);
@@ -339,3 +486,28 @@ BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userda
 
 	return plugins_manager->RegisterPlugin(plugins_manager, &plugin);
 }
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+#if defined(BUILD_SHARED_LIBS)
+	[[nodiscard]]
+	FREERDP_API BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata);
+
+	BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
+	{
+		return int_proxy_module_entry_point(plugins_manager, userdata);
+	}
+#else
+[[nodiscard]]
+FREERDP_API BOOL demo_proxy_module_entry_point(proxyPluginsManager* plugins_manager,
+                                               void* userdata);
+BOOL demo_proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
+{
+	return int_proxy_module_entry_point(plugins_manager, userdata);
+}
+#endif
+#ifdef __cplusplus
+}
+#endif

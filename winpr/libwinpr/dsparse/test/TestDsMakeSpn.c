@@ -11,11 +11,12 @@ static BOOL test_DsMakeSpnA(void)
 	LPCSTR testServiceName = "LAB1-W2K8R2-GW.lab1.awake.local";
 	LPCSTR testSpn = "HTTP/LAB1-W2K8R2-GW.lab1.awake.local";
 	BOOL rc = FALSE;
-	CHAR Spn[100] = { 0 };
-	DWORD status;
+	CHAR Spn[100] = WINPR_C_ARRAY_INIT;
+	DWORD status = 0;
 	DWORD SpnLength = -1;
 
-	status = DsMakeSpnA(testServiceClass, testServiceName, NULL, 0, NULL, &SpnLength, NULL);
+	status =
+	    DsMakeSpnA(testServiceClass, testServiceName, nullptr, 0, nullptr, &SpnLength, nullptr);
 
 	if (status != ERROR_INVALID_PARAMETER)
 	{
@@ -24,7 +25,8 @@ static BOOL test_DsMakeSpnA(void)
 	}
 
 	SpnLength = 0;
-	status = DsMakeSpnA(testServiceClass, testServiceName, NULL, 0, NULL, &SpnLength, NULL);
+	status =
+	    DsMakeSpnA(testServiceClass, testServiceName, nullptr, 0, nullptr, &SpnLength, nullptr);
 
 	if (status != ERROR_BUFFER_OVERFLOW)
 	{
@@ -38,7 +40,7 @@ static BOOL test_DsMakeSpnA(void)
 		goto fail;
 	}
 
-	status = DsMakeSpnA(testServiceClass, testServiceName, NULL, 0, NULL, &SpnLength, Spn);
+	status = DsMakeSpnA(testServiceClass, testServiceName, nullptr, 0, nullptr, &SpnLength, Spn);
 
 	if (status != ERROR_SUCCESS)
 	{
@@ -60,19 +62,30 @@ fail:
 
 static BOOL test_DsMakeSpnW(void)
 {
-	WCHAR testServiceClass[] = { 'H', 'T', 'T', 'P', '\0' };
-	WCHAR testServiceName[] = { 'L', 'A', 'B', '1', '-', 'W', '2', 'K', '8', 'R', '2',
-		                        '-', 'G', 'W', '.', 'l', 'a', 'b', '1', '.', 'a', 'w',
-		                        'a', 'k', 'e', '.', 'l', 'o', 'c', 'a', 'l', '\0' };
-	WCHAR testSpn[] = { 'H', 'T', 'T', 'P', '/', 'L', 'A', 'B', '1', '-', 'W', '2', 'K',
-		                '8', 'R', '2', '-', 'G', 'W', '.', 'l', 'a', 'b', '1', '.', 'a',
-		                'w', 'a', 'k', 'e', '.', 'l', 'o', 'c', 'a', 'l', '\0' };
+	const CHAR ctestServiceClass[] = { 'H', 'T', 'T', 'P', '\0' };
+	const CHAR ctestServiceName[] = { 'L', 'A', 'B', '1', '-', 'W', '2', 'K', '8', 'R', '2',
+		                              '-', 'G', 'W', '.', 'l', 'a', 'b', '1', '.', 'a', 'w',
+		                              'a', 'k', 'e', '.', 'l', 'o', 'c', 'a', 'l', '\0' };
+	const CHAR ctestSpn[] = { 'H', 'T', 'T', 'P', '/', 'L', 'A', 'B', '1', '-', 'W', '2', 'K',
+		                      '8', 'R', '2', '-', 'G', 'W', '.', 'l', 'a', 'b', '1', '.', 'a',
+		                      'w', 'a', 'k', 'e', '.', 'l', 'o', 'c', 'a', 'l', '\0' };
+	WCHAR testServiceClass[ARRAYSIZE(ctestServiceClass)] = WINPR_C_ARRAY_INIT;
+	WCHAR testServiceName[ARRAYSIZE(ctestServiceName)] = WINPR_C_ARRAY_INIT;
+	WCHAR testSpn[ARRAYSIZE(ctestSpn)] = WINPR_C_ARRAY_INIT;
+
 	BOOL rc = FALSE;
-	WCHAR Spn[100] = { 0 };
-	DWORD status;
+	WCHAR Spn[100] = WINPR_C_ARRAY_INIT;
+	DWORD status = 0;
 	DWORD SpnLength = -1;
 
-	status = DsMakeSpnW(testServiceClass, testServiceName, NULL, 0, NULL, &SpnLength, NULL);
+	(void)ConvertUtf8NToWChar(ctestServiceClass, ARRAYSIZE(ctestServiceClass), testServiceClass,
+	                          ARRAYSIZE(testServiceClass));
+	(void)ConvertUtf8NToWChar(ctestServiceName, ARRAYSIZE(ctestServiceName), testServiceName,
+	                          ARRAYSIZE(testServiceName));
+	(void)ConvertUtf8NToWChar(ctestSpn, ARRAYSIZE(ctestSpn), testSpn, ARRAYSIZE(testSpn));
+
+	status =
+	    DsMakeSpnW(testServiceClass, testServiceName, nullptr, 0, nullptr, &SpnLength, nullptr);
 
 	if (status != ERROR_INVALID_PARAMETER)
 	{
@@ -81,7 +94,8 @@ static BOOL test_DsMakeSpnW(void)
 	}
 
 	SpnLength = 0;
-	status = DsMakeSpnW(testServiceClass, testServiceName, NULL, 0, NULL, &SpnLength, NULL);
+	status =
+	    DsMakeSpnW(testServiceClass, testServiceName, nullptr, 0, nullptr, &SpnLength, nullptr);
 
 	if (status != ERROR_BUFFER_OVERFLOW)
 	{
@@ -95,7 +109,7 @@ static BOOL test_DsMakeSpnW(void)
 		goto fail;
 	}
 
-	status = DsMakeSpnW(testServiceClass, testServiceName, NULL, 0, NULL, &SpnLength, Spn);
+	status = DsMakeSpnW(testServiceClass, testServiceName, nullptr, 0, nullptr, &SpnLength, Spn);
 
 	if (status != ERROR_SUCCESS)
 	{
@@ -105,20 +119,22 @@ static BOOL test_DsMakeSpnW(void)
 
 	if (_wcscmp(Spn, testSpn) != 0)
 	{
-		char buffer1[8192];
-		char buffer2[8192];
+		char buffer1[8192] = WINPR_C_ARRAY_INIT;
+		char buffer2[8192] = WINPR_C_ARRAY_INIT;
 		char* SpnA = buffer1;
 		char* testSpnA = buffer2;
-		ConvertFromUnicode(CP_UTF8, 0, Spn, -1, &SpnA, sizeof(SpnA), NULL, NULL);
-		ConvertFromUnicode(CP_UTF8, 0, testSpn, -1, &testSpnA, sizeof(testSpnA), NULL, NULL);
+
+		(void)ConvertWCharToUtf8(Spn, SpnA, ARRAYSIZE(buffer1));
+		(void)ConvertWCharToUtf8(testSpn, testSpnA, ARRAYSIZE(buffer2));
 		printf("DsMakeSpnW: SPN mismatch: Actual: %s, Expected: %s\n", SpnA, testSpnA);
 		goto fail;
 	}
 
 	{
-		char buffer[8192];
+		char buffer[8192] = WINPR_C_ARRAY_INIT;
 		char* SpnA = buffer;
-		ConvertFromUnicode(CP_UTF8, 0, Spn, -1, &SpnA, sizeof(SpnA), NULL, NULL);
+
+		(void)ConvertWCharToUtf8(Spn, SpnA, ARRAYSIZE(buffer));
 		printf("DsMakeSpnW: %s\n", SpnA);
 	}
 

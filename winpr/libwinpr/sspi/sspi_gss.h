@@ -25,8 +25,11 @@
 #include <winpr/sspi.h>
 #include <winpr/asn1.h>
 
-#ifdef WITH_GSSAPI
-#include <krb5/krb5.h>
+#ifdef WITH_KRB5_MIT
+#include <krb5.h>
+typedef krb5_data sspi_gss_data;
+#elif defined(WITH_KRB5_HEIMDAL)
+#include <krb5.h>
 typedef krb5_data sspi_gss_data;
 #else
 typedef struct
@@ -66,7 +69,8 @@ typedef struct
 
 #define GSS_CHECKSUM_TYPE 0x8003
 
-static INLINE BOOL sspi_gss_oid_compare(const WinPrAsn1_OID* oid1, const WinPrAsn1_OID* oid2)
+WINPR_ATTR_NODISCARD
+static inline BOOL sspi_gss_oid_compare(const WinPrAsn1_OID* oid1, const WinPrAsn1_OID* oid2)
 {
 	WINPR_ASSERT(oid1);
 	WINPR_ASSERT(oid2);
@@ -74,8 +78,11 @@ static INLINE BOOL sspi_gss_oid_compare(const WinPrAsn1_OID* oid1, const WinPrAs
 	return (oid1->len == oid2->len) && (memcmp(oid1->data, oid2->data, oid1->len) == 0);
 }
 
+WINPR_ATTR_NODISCARD
 BOOL sspi_gss_wrap_token(SecBuffer* buf, const WinPrAsn1_OID* oid, uint16_t tok_id,
                          const sspi_gss_data* token);
+
+WINPR_ATTR_NODISCARD
 BOOL sspi_gss_unwrap_token(const SecBuffer* buf, WinPrAsn1_OID* oid, uint16_t* tok_id,
                            sspi_gss_data* token);
 

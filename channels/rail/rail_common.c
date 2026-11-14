@@ -90,8 +90,8 @@ const char* rail_get_order_type_string(UINT16 orderType)
 
 const char* rail_get_order_type_string_full(UINT16 orderType, char* buffer, size_t length)
 {
-	_snprintf(buffer, length, "%s[0x%04" PRIx16 "]", rail_get_order_type_string(orderType),
-	          orderType);
+	(void)_snprintf(buffer, length, "%s[0x%04" PRIx16 "]", rail_get_order_type_string(orderType),
+	                orderType);
 	return buffer;
 }
 
@@ -110,22 +110,41 @@ UINT rail_read_pdu_header(wStream* s, UINT16* orderType, UINT16* orderLength)
 
 	Stream_Read_UINT16(s, *orderType);   /* orderType (2 bytes) */
 	Stream_Read_UINT16(s, *orderLength); /* orderLength (2 bytes) */
+	if (*orderLength < RAIL_PDU_HEADER_LENGTH)
+	{
+		WLog_ERR(TAG, "invalid order length %" PRIu16 " < RAIL_PDU_HEADER_LENGTH(%u)", *orderLength,
+		         RAIL_PDU_HEADER_LENGTH);
+		return ERROR_INVALID_DATA;
+	}
+
+	if (!Stream_CheckAndLogRequiredLength(TAG, s, *orderLength - RAIL_PDU_HEADER_LENGTH))
+		return ERROR_INVALID_DATA;
+
+	if (*orderLength > RAIL_PDU_MAX_LENGTH)
+	{
+		WLog_ERR(TAG, "invalid order length %" PRIu16 " < RAIL_PDU_MAX_LENGTH(%llu)", *orderLength,
+		         RAIL_PDU_MAX_LENGTH);
+		return ERROR_INVALID_DATA;
+	}
+
 	return CHANNEL_RC_OK;
 }
 
-void rail_write_pdu_header(wStream* s, UINT16 orderType, UINT16 orderLength)
+BOOL rail_write_pdu_header(wStream* s, UINT16 orderType, UINT16 orderLength)
 {
+	if (!Stream_EnsureRemainingCapacity(s, 4))
+		return FALSE;
 	Stream_Write_UINT16(s, orderType);   /* orderType (2 bytes) */
 	Stream_Write_UINT16(s, orderLength); /* orderLength (2 bytes) */
+	return TRUE;
 }
 
 wStream* rail_pdu_init(size_t length)
 {
-	wStream* s;
-	s = Stream_New(NULL, length + RAIL_PDU_HEADER_LENGTH);
+	wStream* s = Stream_New(nullptr, length + RAIL_PDU_HEADER_LENGTH);
 
 	if (!s)
-		return NULL;
+		return nullptr;
 
 	Stream_Seek(s, RAIL_PDU_HEADER_LENGTH);
 	return s;
@@ -147,6 +166,9 @@ UINT rail_read_handshake_order(wStream* s, RAIL_HANDSHAKE_ORDER* handshake)
 
 void rail_write_handshake_order(wStream* s, const RAIL_HANDSHAKE_ORDER* handshake)
 {
+	WINPR_ASSERT(s);
+	WINPR_ASSERT(handshake);
+	WINPR_ASSERT(Stream_EnsureRemainingCapacity(s, 4));
 	Stream_Write_UINT32(s, handshake->buildNumber); /* buildNumber (4 bytes) */
 }
 
@@ -167,57 +189,12 @@ UINT rail_read_handshake_ex_order(wStream* s, RAIL_HANDSHAKE_EX_ORDER* handshake
 
 void rail_write_handshake_ex_order(wStream* s, const RAIL_HANDSHAKE_EX_ORDER* handshakeEx)
 {
+	WINPR_ASSERT(s);
+	WINPR_ASSERT(handshakeEx);
+	WINPR_ASSERT(Stream_EnsureRemainingCapacity(s, 8));
+
 	Stream_Write_UINT32(s, handshakeEx->buildNumber);        /* buildNumber (4 bytes) */
 	Stream_Write_UINT32(s, handshakeEx->railHandshakeFlags); /* railHandshakeFlags (4 bytes) */
-}
-
-/**
- * Function description
- *
- * @return 0 on success, otherwise a Win32 error code
- */
-UINT rail_write_unicode_string(wStream* s, const RAIL_UNICODE_STRING* unicode_string)
-{
-	if (!s || !unicode_string)
-		return ERROR_INVALID_PARAMETER;
-
-	if (!Stream_EnsureRemainingCapacity(s, 2 + unicode_string->length))
-	{
-		WLog_ERR(TAG, "Stream_EnsureRemainingCapacity failed!");
-		return CHANNEL_RC_NO_MEMORY;
-	}
-
-	Stream_Write_UINT16(s, unicode_string->length);                  /* cbString (2 bytes) */
-	Stream_Write(s, unicode_string->string, unicode_string->length); /* string */
-	return CHANNEL_RC_OK;
-}
-
-/**
- * Function description
- *
- * @return 0 on success, otherwise a Win32 error code
- */
-UINT rail_write_unicode_string_value(wStream* s, const RAIL_UNICODE_STRING* unicode_string)
-{
-	size_t length;
-
-	if (!s || !unicode_string)
-		return ERROR_INVALID_PARAMETER;
-
-	length = unicode_string->length;
-
-	if (length > 0)
-	{
-		if (!Stream_EnsureRemainingCapacity(s, length))
-		{
-			WLog_ERR(TAG, "Stream_EnsureRemainingCapacity failed!");
-			return CHANNEL_RC_NO_MEMORY;
-		}
-
-		Stream_Write(s, unicode_string->string, length); /* string */
-	}
-
-	return CHANNEL_RC_OK;
 }
 
 /**
@@ -248,7 +225,7 @@ static UINT rail_read_high_contrast(wStream* s, RAIL_HIGH_CONTRAST* highContrast
  */
 static UINT rail_write_high_contrast(wStream* s, const RAIL_HIGH_CONTRAST* highContrast)
 {
-	UINT32 colorSchemeLength;
+	UINT32 colorSchemeLength = 0;
 
 	if (!s || !highContrast)
 		return ERROR_INVALID_PARAMETER;
@@ -311,7 +288,7 @@ static UINT rail_write_filterkeys(wStream* s, const TS_FILTERKEYS* filterKeys)
  */
 UINT rail_read_sysparam_order(wStream* s, RAIL_SYSPARAM_ORDER* sysparam, BOOL extendedSpiSupported)
 {
-	BYTE body;
+	BYTE body = 0;
 	UINT error = CHANNEL_RC_OK;
 
 	if (!s || !sysparam)
@@ -469,15 +446,10 @@ UINT rail_read_sysparam_order(wStream* s, RAIL_SYSPARAM_ORDER* sysparam, BOOL ex
 	return error;
 }
 
-/**
- * Function description
- *
- * @return 0 on success, otherwise a Win32 err2or code
- */
 UINT rail_write_sysparam_order(wStream* s, const RAIL_SYSPARAM_ORDER* sysparam,
                                BOOL extendedSpiSupported)
 {
-	BYTE body;
+	BYTE body = 0;
 	UINT error = CHANNEL_RC_OK;
 
 	if (!s || !sysparam)
@@ -587,5 +559,33 @@ UINT rail_write_sysparam_order(wStream* s, const RAIL_SYSPARAM_ORDER* sysparam,
 
 BOOL rail_is_extended_spi_supported(UINT32 channelFlags)
 {
-	return channelFlags & TS_RAIL_ORDER_HANDSHAKE_EX_FLAGS_EXTENDED_SPI_SUPPORTED;
+	return (channelFlags & TS_RAIL_ORDER_HANDSHAKE_EX_FLAGS_EXTENDED_SPI_SUPPORTED) != 0;
+}
+
+const char* rail_handshake_ex_flags_to_string(UINT32 flags, char* buffer, size_t len)
+{
+	if (len < 1)
+		return nullptr;
+
+	(void)_snprintf(buffer, len, "{");
+	char* fbuffer = &buffer[1];
+	len--;
+
+	if (flags & TS_RAIL_ORDER_HANDSHAKEEX_FLAGS_HIDEF)
+		winpr_str_append("HIDEF", fbuffer, len, "|");
+	if (flags & TS_RAIL_ORDER_HANDSHAKE_EX_FLAGS_EXTENDED_SPI_SUPPORTED)
+		winpr_str_append("EXTENDED_SPI_SUPPORTED", fbuffer, len, "|");
+	if (flags & TS_RAIL_ORDER_HANDSHAKE_EX_FLAGS_SNAP_ARRANGE_SUPPORTED)
+		winpr_str_append("SNAP_ARRANGE_SUPPORTED", fbuffer, len, "|");
+	if (flags & TS_RAIL_ORDER_HANDSHAKE_EX_FLAGS_TEXT_SCALE_SUPPORTED)
+		winpr_str_append("TEXT_SCALE_SUPPORTED", fbuffer, len, "|");
+	if (flags & TS_RAIL_ORDER_HANDSHAKE_EX_FLAGS_CARET_BLINK_SUPPORTED)
+		winpr_str_append("CARET_BLINK_SUPPORTED", fbuffer, len, "|");
+	if (flags & TS_RAIL_ORDER_HANDSHAKE_EX_FLAGS_EXTENDED_SPI_2_SUPPORTED)
+		winpr_str_append("EXTENDED_SPI_2_SUPPORTED", fbuffer, len, "|");
+
+	char number[16] = WINPR_C_ARRAY_INIT;
+	(void)_snprintf(number, sizeof(number), "[0x%08" PRIx32 "]", flags);
+	winpr_str_append(number, buffer, len, "}");
+	return buffer;
 }

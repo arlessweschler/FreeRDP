@@ -1,0 +1,48 @@
+name: macos-builder
+on:
+  workflow_dispatch:
+    branches: [ master, stable* ]
+  schedule:
+    - cron: '30 5 * * SUN'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    name: "Run macos build on mac-latest"
+    steps:
+      - name: "Check out source"
+        uses: actions/checkout@v7
+
+      - name: "Prepare environment"
+        run: |
+          brew install autoconf automake git libtool meson
+
+      - name: Restore Dependencies
+        id: restore-dependencies
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build-macos/install/**
+          key: ${{ runner.os }}-mac-${{ hashFiles('scripts/bundle-mac-os.sh') }}
+
+      - name: Build Dependencies
+        if: steps.restore-dependencies.outputs.cache-hit != 'true'
+        run: |
+          ./scripts/bundle-mac-os.sh --build-deps-only
+      
+      - name: Save Dependencies
+        if: steps.restore-dependencies.outputs.cache-hit != 'true'
+        id: save-dependencies
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            build-macos/install/**
+          key: ${{ runner.os }}-mac-${{ hashFiles('scripts/bundle-mac-os.sh') }}
+
+      - name: "Log workspace before build"
+        run: |
+          find build-macos
+
+      - name: "Run mac os build..."
+        run: |
+          ./scripts/bundle-mac-os.sh -d

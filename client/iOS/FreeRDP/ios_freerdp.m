@@ -9,35 +9,47 @@
  */
 
 #include <winpr/assert.h>
+#import <winpr/clipboard.h>
 
 #import <freerdp/gdi/gdi.h>
+#import <freerdp/codec/color.h>
 #import <freerdp/channels/channels.h>
 #import <freerdp/client/channels.h>
 #import <freerdp/client/cmdline.h>
 #import <freerdp/freerdp.h>
 #import <freerdp/gdi/gfx.h>
+#import <freerdp/client/cliprdr.h>
 
 #import "ios_freerdp.h"
 #import "ios_freerdp_ui.h"
 #import "ios_freerdp_events.h"
+#import "ios_cliprdr.h"
 
 #import "RDPSession.h"
+#import "RDPCursor.h"
 #import "Utils.h"
 
 #include <errno.h>
 
 #define TAG FREERDP_TAG("iOS")
 
+typedef struct
+{
+	rdpPointer pointer;
+	RDPCursor *cursor;
+} iosPointer;
+
 #pragma mark Connection helpers
 
 static void ios_OnChannelConnectedEventHandler(void *context, const ChannelConnectedEventArgs *e)
 {
+	WLog_INFO(TAG, "ios_OnChannelConnectedEventHandler, channel %s", e->name);
 	rdpSettings *settings;
 	mfContext *afc;
 
 	if (!context || !e)
 	{
-		WLog_FATAL(TAG, "%s(context=%p, EventArgs=%p", __FUNCTION__, context, (void *)e);
+		WLog_FATAL(TAG, "(context=%p, EventArgs=%p", context, (void *)e);
 		return;
 	}
 
@@ -46,7 +58,7 @@ static void ios_OnChannelConnectedEventHandler(void *context, const ChannelConne
 
 	if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0)
 	{
-		if (settings->SoftwareGdi)
+		if (freerdp_settings_get_bool(settings, FreeRDP_SoftwareGdi))
 		{
 			gdi_graphics_pipeline_init(afc->_p.gdi, (RdpgfxClientContext *)e->pInterface);
 		}
@@ -56,17 +68,22 @@ static void ios_OnChannelConnectedEventHandler(void *context, const ChannelConne
 			               " This is not supported, add /gdi:sw");
 		}
 	}
+	else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
+	{
+		ios_cliprdr_init(afc, (CliprdrClientContext *)e->pInterface);
+	}
 }
 
 static void ios_OnChannelDisconnectedEventHandler(void *context,
                                                   const ChannelDisconnectedEventArgs *e)
 {
+	WLog_INFO(TAG, "ios_OnChannelConnectedEventHandler, channel %s", e->name);
 	rdpSettings *settings;
 	mfContext *afc;
 
 	if (!context || !e)
 	{
-		WLog_FATAL(TAG, "%s(context=%p, EventArgs=%p", __FUNCTION__, context, (void *)e);
+		WLog_FATAL(TAG, "(context=%p, EventArgs=%p", context, (void *)e);
 		return;
 	}
 
@@ -75,7 +92,7 @@ static void ios_OnChannelDisconnectedEventHandler(void *context,
 
 	if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0)
 	{
-		if (settings->SoftwareGdi)
+		if (freerdp_settings_get_bool(settings, FreeRDP_SoftwareGdi))
 		{
 			gdi_graphics_pipeline_uninit(afc->_p.gdi, (RdpgfxClientContext *)e->pInterface);
 		}
@@ -84,6 +101,10 @@ static void ios_OnChannelDisconnectedEventHandler(void *context,
 			WLog_WARN(TAG, "GFX without software GDI requested. "
 			               " This is not supported, add /gdi:sw");
 		}
+	}
+	else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
+	{
+		ios_cliprdr_uninit(afc, (CliprdrClientContext *)e->pInterface);
 	}
 }
 
@@ -98,14 +119,23 @@ static BOOL ios_pre_connect(freerdp *instance)
 	settings = instance->context->settings;
 	WINPR_ASSERT(settings);
 
-	settings->AutoLogonEnabled = settings->Password && (strlen(settings->Password) > 0);
+	const char *Password = freerdp_settings_get_string(settings, FreeRDP_Password);
+	if (!freerdp_settings_set_bool(settings, FreeRDP_AutoLogonEnabled,
+	                               Password && (Password && (strlen(Password) > 0))))
+		return FALSE;
+
+	if (!freerdp_settings_set_bool(settings, FreeRDP_GrabMouse, TRUE))
+		return FALSE;
 
 	// Verify screen width/height are sane
-	if ((settings->DesktopWidth < 64) || (settings->DesktopHeight < 64) ||
-	    (settings->DesktopWidth > 4096) || (settings->DesktopHeight > 4096))
+	if ((freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth) < 64) ||
+	    (freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight) < 64) ||
+	    (freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth) > 4096) ||
+	    (freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight) > 4096))
 	{
-		NSLog(@"%s: invalid dimensions %d %d", __func__, settings->DesktopWidth,
-		      settings->DesktopHeight);
+		NSLog(@"%s: invalid dimensions %d %d", __func__,
+		      freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth),
+		      freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight));
 		return FALSE;
 	}
 
@@ -114,7 +144,7 @@ static BOOL ios_pre_connect(freerdp *instance)
 
 	if (rc != CHANNEL_RC_OK)
 	{
-		WLog_ERR(TAG, "Could not subscribe to connect event handler [%l08X]", rc);
+		WLog_ERR(TAG, "Could not subscribe to connect event handler [0x%08X]", (unsigned)rc);
 		return FALSE;
 	}
 
@@ -123,13 +153,13 @@ static BOOL ios_pre_connect(freerdp *instance)
 
 	if (rc != CHANNEL_RC_OK)
 	{
-		WLog_ERR(TAG, "Could not subscribe to disconnect event handler [%l08X]", rc);
+		WLog_ERR(TAG, "Could not subscribe to disconnect event handler [0x%08X]", (unsigned)rc);
 		return FALSE;
 	}
 
 	if (!freerdp_client_load_addins(instance->context->channels, settings))
 	{
-		WLog_ERR(TAG, "Failed to load addins [%l08X]", GetLastError());
+		WLog_ERR(TAG, "Failed to load addins [0x%08X]", (unsigned)GetLastError());
 		return FALSE;
 	}
 
@@ -141,6 +171,31 @@ static BOOL ios_Pointer_New(rdpContext *context, rdpPointer *pointer)
 	if (!context || !pointer || !context->gdi)
 		return FALSE;
 
+	// codes from android client code.
+	iosPointer *ptr = (iosPointer *)pointer;
+	const size_t size = 4 * pointer->width * pointer->height; // BGRA32
+	BYTE *data = winpr_aligned_malloc(size, 16);
+	if (!data)
+		return FALSE;
+
+	// get RDP server cursor
+	if (!freerdp_image_copy_from_pointer_data(
+	        data, PIXEL_FORMAT_RGBA32, 0, 0, 0, pointer->width, pointer->height,
+	        pointer->xorMaskData, pointer->lengthXorMask, pointer->andMaskData,
+	        pointer->lengthAndMask, pointer->xorBpp, &context->gdi->palette))
+	{
+		winpr_aligned_free(data);
+		return FALSE;
+	}
+
+	ptr->cursor = [[RDPCursor alloc] initWithRGBABytes:data
+	                                             width:pointer->width
+	                                            height:pointer->height
+	                                           hotspot:CGPointMake(pointer->xPos, pointer->yPos)];
+	winpr_aligned_free(data);
+	if (!ptr->cursor)
+		return FALSE;
+
 	return TRUE;
 }
 
@@ -148,48 +203,86 @@ static void ios_Pointer_Free(rdpContext *context, rdpPointer *pointer)
 {
 	if (!context || !pointer)
 		return;
+
+	iosPointer *ptr = (iosPointer *)pointer;
+	[ptr->cursor release];
+	ptr->cursor = nil;
 }
 
 static BOOL ios_Pointer_Set(rdpContext *context, rdpPointer *pointer)
 {
-	if (!context)
+	if (!context || !context->instance || !pointer)
 		return FALSE;
+
+	mfInfo *mfi = MFI_FROM_INSTANCE(context->instance);
+	iosPointer *ptr = (iosPointer *)pointer;
+	if (!mfi || !mfi->session || !ptr->cursor)
+		return FALSE;
+
+	[mfi->session performSelectorOnMainThread:@selector(setRemoteCursor:)
+	                               withObject:ptr->cursor
+	                            waitUntilDone:YES];
 
 	return TRUE;
 }
 
 static BOOL ios_Pointer_SetPosition(rdpContext *context, UINT32 x, UINT32 y)
 {
-	if (!context)
+	if (!context || !context->instance)
 		return FALSE;
+
+	mfInfo *mfi = MFI_FROM_INSTANCE(context->instance);
+	if (!mfi || !mfi->session)
+		return FALSE;
+
+	NSValue *position = [NSValue valueWithCGPoint:CGPointMake(x, y)];
+	[mfi->session performSelectorOnMainThread:@selector(setRemoteCursorPositionValue:)
+	                               withObject:position
+	                            waitUntilDone:NO];
 
 	return TRUE;
 }
 
 static BOOL ios_Pointer_SetNull(rdpContext *context)
 {
-	if (!context)
+	if (!context || !context->instance)
 		return FALSE;
+
+	mfInfo *mfi = MFI_FROM_INSTANCE(context->instance);
+	if (!mfi || !mfi->session)
+		return FALSE;
+
+	[mfi->session performSelectorOnMainThread:@selector(hideRemoteCursor)
+	                               withObject:nil
+	                            waitUntilDone:NO];
 
 	return TRUE;
 }
 
 static BOOL ios_Pointer_SetDefault(rdpContext *context)
 {
-	if (!context)
+	if (!context || !context->instance)
 		return FALSE;
+
+	mfInfo *mfi = MFI_FROM_INSTANCE(context->instance);
+	if (!mfi || !mfi->session)
+		return FALSE;
+
+	[mfi->session performSelectorOnMainThread:@selector(setDefaultRemoteCursor)
+	                               withObject:nil
+	                            waitUntilDone:NO];
 
 	return TRUE;
 }
 
 static BOOL ios_register_pointer(rdpGraphics *graphics)
 {
-	rdpPointer pointer;
+	rdpPointer pointer = WINPR_C_ARRAY_INIT;
 
 	if (!graphics)
 		return FALSE;
 
-	pointer.size = sizeof(pointer);
+	pointer.size = sizeof(iosPointer);
 	pointer.New = ios_Pointer_New;
 	pointer.Free = ios_Pointer_Free;
 	pointer.Set = ios_Pointer_Set;
@@ -236,6 +329,22 @@ static void ios_post_disconnect(freerdp *instance)
 #pragma mark -
 #pragma mark Running the connection
 
+static BOOL ios_reconnect(freerdp *instance)
+{
+	mfInfo *mfi = MFI_FROM_INSTANCE(instance);
+
+	// keeps input from being queued for the dropped connection and lets cancel abort the attempts
+	mfi->connection_state = TSXConnectionConnecting;
+	if (!client_auto_reconnect_ex(instance, nullptr))
+		return FALSE;
+
+	mfi->connection_state = TSXConnectionConnected;
+	[mfi->session performSelectorOnMainThread:@selector(sessionDidReconnect)
+	                               withObject:nil
+	                            waitUntilDone:NO];
+	return TRUE;
+}
+
 int ios_run_freerdp(freerdp *instance)
 {
 	mfContext *context = (mfContext *)instance->context;
@@ -260,7 +369,7 @@ int ios_run_freerdp(freerdp *instance)
 	{
 		DWORD status;
 		DWORD nCount = 0;
-		HANDLE handles[MAXIMUM_WAIT_OBJECTS] = { 0 };
+		HANDLE handles[MAXIMUM_WAIT_OBJECTS] = WINPR_C_ARRAY_INIT;
 		pool = [[NSAutoreleasePool alloc] init];
 
 		nCount = freerdp_get_event_handles(instance->context, handles, ARRAYSIZE(handles));
@@ -281,7 +390,7 @@ int ios_run_freerdp(freerdp *instance)
 		}
 
 		// Check the libfreerdp fds
-		if (!freerdp_check_event_handles(instance->context))
+		if (!freerdp_check_event_handles(instance->context) && !ios_reconnect(instance))
 		{
 			NSLog(@"%s: freerdp_check_event_handles failed.", __func__);
 			break;
@@ -300,12 +409,11 @@ int ios_run_freerdp(freerdp *instance)
 	}
 
 	CGContextRelease(mfi->bitmap_context);
-	mfi->bitmap_context = NULL;
+	mfi->bitmap_context = nullptr;
 	mfi->connection_state = TSXConnectionDisconnected;
 	// Cleanup
 	freerdp_disconnect(instance);
 	gdi_free(instance);
-	cache_free(instance->context->cache);
 	[pool release];
 	pool = nil;
 	return MF_EXIT_SUCCESS;
@@ -321,7 +429,7 @@ static BOOL ios_client_new(freerdp *instance, rdpContext *context)
 	if (!instance || !context)
 		return FALSE;
 
-	if ((ctx->mfi = calloc(1, sizeof(mfInfo))) == NULL)
+	if ((ctx->mfi = calloc(1, sizeof(mfInfo))) == nullptr)
 		return FALSE;
 
 	ctx->mfi->context = (mfContext *)context;
@@ -334,11 +442,11 @@ static BOOL ios_client_new(freerdp *instance, rdpContext *context)
 	instance->PreConnect = ios_pre_connect;
 	instance->PostConnect = ios_post_connect;
 	instance->PostDisconnect = ios_post_disconnect;
-	instance->Authenticate = ios_ui_authenticate;
-	instance->GatewayAuthenticate = ios_ui_gw_authenticate;
+	instance->AuthenticateEx = ios_ui_authenticate_ex;
 	instance->VerifyCertificateEx = ios_ui_verify_certificate_ex;
 	instance->VerifyChangedCertificateEx = ios_ui_verify_changed_certificate_ex;
-	instance->LogonErrorInfo = NULL;
+	instance->RetryDialog = ios_ui_retry_dialog;
+	instance->LogonErrorInfo = nullptr;
 	return TRUE;
 }
 
@@ -356,16 +464,18 @@ static void ios_client_free(freerdp *instance, rdpContext *context)
 
 static int RdpClientEntry(RDP_CLIENT_ENTRY_POINTS *pEntryPoints)
 {
+	WINPR_ASSERT(pEntryPoints);
+
 	ZeroMemory(pEntryPoints, sizeof(RDP_CLIENT_ENTRY_POINTS));
 	pEntryPoints->Version = RDP_CLIENT_INTERFACE_VERSION;
 	pEntryPoints->Size = sizeof(RDP_CLIENT_ENTRY_POINTS_V1);
-	pEntryPoints->GlobalInit = NULL;
-	pEntryPoints->GlobalUninit = NULL;
+	pEntryPoints->GlobalInit = nullptr;
+	pEntryPoints->GlobalUninit = nullptr;
 	pEntryPoints->ContextSize = sizeof(mfContext);
 	pEntryPoints->ClientNew = ios_client_new;
 	pEntryPoints->ClientFree = ios_client_free;
-	pEntryPoints->ClientStart = NULL;
-	pEntryPoints->ClientStop = NULL;
+	pEntryPoints->ClientStart = nullptr;
+	pEntryPoints->ClientStop = nullptr;
 	return 0;
 }
 
@@ -380,7 +490,7 @@ freerdp *ios_freerdp_new()
 	context = freerdp_client_context_new(&clientEntryPoints);
 
 	if (!context)
-		return NULL;
+		return nullptr;
 
 	return context->instance;
 }
@@ -402,7 +512,7 @@ void ios_uninit_freerdp()
 {
 }
 
-/* compatibilty functions */
+/* compatibility functions */
 size_t fwrite$UNIX2003(const void *ptr, size_t size, size_t nmemb, FILE *stream)
 {
 	return fwrite(ptr, size, nmemb, stream);

@@ -21,6 +21,7 @@
 
 #include <stdio.h>
 #include <winpr/assert.h>
+#include <winpr/cast.h>
 #include <winpr/crt.h>
 #include <winpr/string.h>
 
@@ -31,15 +32,14 @@
 
 BOOL ber_read_length(wStream* s, size_t* length)
 {
-	BYTE byte;
-
 	WINPR_ASSERT(s);
 	WINPR_ASSERT(length);
 
+	*length = 0;
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 1))
 		return FALSE;
 
-	Stream_Read_UINT8(s, byte);
+	BYTE byte = Stream_Get_UINT8(s);
 
 	if (byte & 0x80)
 	{
@@ -53,7 +53,10 @@ BOOL ber_read_length(wStream* s, size_t* length)
 		else if (byte == 2)
 			Stream_Read_UINT16_BE(s, *length);
 		else
+		{
+			WLog_ERR(TAG, "ber: unexpected byte 0x%02" PRIx8 ", expected [1,2]", byte);
 			return FALSE;
+		}
 	}
 	else
 	{
@@ -75,22 +78,24 @@ size_t ber_write_length(wStream* s, size_t length)
 
 	if (length > 0xFF)
 	{
+		WINPR_ASSERT(length <= UINT16_MAX);
 		WINPR_ASSERT(Stream_GetRemainingCapacity(s) >= 3);
 		Stream_Write_UINT8(s, 0x80 ^ 2);
-		Stream_Write_UINT16_BE(s, length);
+		Stream_Write_UINT16_BE(s, (UINT16)length);
 		return 3;
 	}
 
+	WINPR_ASSERT(length <= UINT8_MAX);
 	if (length > 0x7F)
 	{
 		WINPR_ASSERT(Stream_GetRemainingCapacity(s) >= 2);
 		Stream_Write_UINT8(s, 0x80 ^ 1);
-		Stream_Write_UINT8(s, length);
+		Stream_Write_UINT8(s, (UINT8)length);
 		return 2;
 	}
 
 	WINPR_ASSERT(Stream_GetRemainingCapacity(s) >= 1);
-	Stream_Write_UINT8(s, length);
+	Stream_Write_UINT8(s, (UINT8)length);
 	return 1;
 }
 
@@ -107,14 +112,16 @@ size_t _ber_sizeof_length(size_t length)
 
 /**
  * Read BER Universal tag.
- * @param s stream
+ *
+ * @param s The stream to read from
  * @param tag BER universally-defined tag
- * @return
+ *
+ * @return \b TRUE for success, \b FALSE otherwise
  */
 
 BOOL ber_read_universal_tag(wStream* s, BYTE tag, BOOL pc)
 {
-	BYTE byte;
+	BYTE byte = 0;
 	const BYTE expect = (BER_CLASS_UNIV | BER_PC(pc) | (BER_TAG_MASK & tag));
 
 	WINPR_ASSERT(s);
@@ -156,7 +163,7 @@ size_t ber_write_universal_tag(wStream* s, BYTE tag, BOOL pc)
 
 BOOL ber_read_application_tag(wStream* s, BYTE tag, size_t* length)
 {
-	BYTE byte;
+	BYTE byte = 0;
 
 	WINPR_ASSERT(s);
 	WINPR_ASSERT(length);
@@ -236,15 +243,14 @@ void ber_write_application_tag(wStream* s, BYTE tag, size_t length)
 BOOL ber_read_contextual_tag(wStream* s, BYTE tag, size_t* length, BOOL pc)
 {
 	const BYTE expect = ((BER_CLASS_CTXT | BER_PC(pc)) | (BER_TAG_MASK & tag));
-	BYTE byte;
+	BYTE byte = 0;
 
 	WINPR_ASSERT(s);
 	WINPR_ASSERT(length);
 
 	if (Stream_GetRemainingLength(s) < 1)
 	{
-		WLog_VRB(TAG, "short data, got %" PRIuz ", expected %" PRIuz, Stream_GetRemainingLength(s),
-		         1);
+		WLog_VRB(TAG, "short data, got %" PRIuz ", expected %u", Stream_GetRemainingLength(s), 1u);
 		return FALSE;
 	}
 
@@ -276,7 +282,7 @@ size_t ber_sizeof_contextual_tag(size_t length)
 BOOL ber_read_sequence_tag(wStream* s, size_t* length)
 {
 	const BYTE expect = ((BER_CLASS_UNIV | BER_CONSTRUCT) | (BER_TAG_SEQUENCE_OF));
-	BYTE byte;
+	BYTE byte = 0;
 
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 1))
 		return FALSE;
@@ -316,7 +322,7 @@ size_t ber_sizeof_sequence_tag(size_t length)
 
 BOOL ber_read_enumerated(wStream* s, BYTE* enumerated, BYTE count)
 {
-	size_t length;
+	size_t length = 0;
 
 	WINPR_ASSERT(enumerated);
 
@@ -325,7 +331,7 @@ BOOL ber_read_enumerated(wStream* s, BYTE* enumerated, BYTE count)
 
 	if (length != 1)
 	{
-		WLog_WARN(TAG, "short data, got %" PRIuz ", expected %" PRIuz, length, 1);
+		WLog_WARN(TAG, "short data, got %" PRIuz ", expected %u", length, 1u);
 		return FALSE;
 	}
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 1))
@@ -343,7 +349,7 @@ BOOL ber_read_enumerated(wStream* s, BYTE* enumerated, BYTE count)
 	return TRUE;
 }
 
-void ber_write_enumerated(wStream* s, BYTE enumerated, BYTE count)
+void ber_write_enumerated(wStream* s, BYTE enumerated, WINPR_ATTR_UNUSED BYTE count)
 {
 	ber_write_universal_tag(s, BER_TAG_ENUMERATED, FALSE);
 	ber_write_length(s, 1);
@@ -384,7 +390,8 @@ size_t ber_write_octet_string(wStream* s, const BYTE* oct_str, size_t length)
 size_t ber_write_contextual_octet_string(wStream* s, BYTE tag, const BYTE* oct_str, size_t length)
 {
 	size_t inner = ber_sizeof_octet_string(length);
-	size_t ret, r;
+	size_t ret = 0;
+	size_t r = 0;
 
 	ret = ber_write_contextual_tag(s, tag, inner, TRUE);
 	if (!ret)
@@ -400,12 +407,18 @@ size_t ber_write_char_to_unicode_octet_string(wStream* s, const char* str)
 {
 	WINPR_ASSERT(str);
 	size_t size = 0;
-	size_t length = strlen(str) + 1;
+
+	const SSIZE_T devNameWLen = ConvertUtf8ToWChar(str, nullptr, 0);
+	if (devNameWLen < 0)
+		return 0;
+	const size_t length = WINPR_ASSERTING_INT_CAST(size_t, devNameWLen) + 1;
+	const size_t slen = strlen(str);
 	size += ber_write_universal_tag(s, BER_TAG_OCTET_STRING, FALSE);
-	size += ber_write_length(s, length * 2);
-	MultiByteToWideChar(CP_UTF8, 0, str, length, (LPWSTR)Stream_Pointer(s), length * 2);
-	Stream_Seek(s, length * 2);
-	return size + length * 2;
+	size += ber_write_length(s, length * sizeof(WCHAR));
+
+	if (Stream_Write_UTF16_String_From_UTF8(s, length, str, slen, TRUE) < 0)
+		return 0;
+	return size + length * sizeof(WCHAR);
 }
 
 size_t ber_write_contextual_unicode_octet_string(wStream* s, BYTE tag, LPWSTR str)
@@ -413,7 +426,7 @@ size_t ber_write_contextual_unicode_octet_string(wStream* s, BYTE tag, LPWSTR st
 	WINPR_ASSERT(str);
 	size_t len = _wcslen(str) * sizeof(WCHAR);
 	size_t inner_len = ber_sizeof_octet_string(len);
-	size_t ret;
+	size_t ret = 0;
 
 	ret = ber_write_contextual_tag(s, tag, inner_len, TRUE);
 	return ret + ber_write_octet_string(s, (const BYTE*)str, len);
@@ -421,26 +434,30 @@ size_t ber_write_contextual_unicode_octet_string(wStream* s, BYTE tag, LPWSTR st
 
 size_t ber_write_contextual_char_to_unicode_octet_string(wStream* s, BYTE tag, const char* str)
 {
-	size_t ret;
-	size_t len = strlen(str);
-	size_t inner_len = ber_sizeof_octet_string(len * 2);
+	size_t ret = 0;
+	const SSIZE_T devNameWLen = ConvertUtf8ToWChar(str, nullptr, 0);
+	if (devNameWLen < 0)
+		return 0;
+	const size_t len = WINPR_ASSERTING_INT_CAST(size_t, devNameWLen);
+	const size_t slen = strlen(str);
+	const size_t inner_len = ber_sizeof_octet_string(len * sizeof(WCHAR));
 
 	WINPR_ASSERT(Stream_GetRemainingCapacity(s) < ber_sizeof_contextual_tag(inner_len) + inner_len);
 
 	ret = ber_write_contextual_tag(s, tag, inner_len, TRUE);
 	ret += ber_write_universal_tag(s, BER_TAG_OCTET_STRING, FALSE);
-	ret += ber_write_length(s, len * 2);
-	if (MultiByteToWideChar(CP_UTF8, 0, str, len, (LPWSTR)Stream_Pointer(s), len * 2) < 0)
+	ret += ber_write_length(s, len * sizeof(WCHAR));
+
+	if (Stream_Write_UTF16_String_From_UTF8(s, len, str, slen, TRUE) < 0)
 		return 0;
-	Stream_Seek(s, len * 2);
 
 	return ret + len;
 }
 
 BOOL ber_read_unicode_octet_string(wStream* s, LPWSTR* str)
 {
-	LPWSTR ret = NULL;
-	size_t length;
+	LPWSTR ret = nullptr;
+	size_t length = 0;
 
 	if (!ber_read_octet_string_tag(s, &length))
 		return FALSE;
@@ -452,7 +469,7 @@ BOOL ber_read_unicode_octet_string(wStream* s, LPWSTR* str)
 	if (!ret)
 		return FALSE;
 
-	memcpy(ret, Stream_Pointer(s), length);
+	memcpy(ret, Stream_ConstPointer(s), length);
 	ret[length / 2] = 0;
 	Stream_Seek(s, length);
 	*str = ret;
@@ -461,23 +478,16 @@ BOOL ber_read_unicode_octet_string(wStream* s, LPWSTR* str)
 
 BOOL ber_read_char_from_unicode_octet_string(wStream* s, char** str)
 {
-	size_t length, outLen;
-	char* ptr;
+	size_t length = 0;
+	char* ptr = nullptr;
 
+	*str = nullptr;
 	if (!ber_read_octet_string_tag(s, &length))
 		return FALSE;
 
-	if (!Stream_CheckAndLogRequiredLength(TAG, s, length))
-		return FALSE;
-
-	outLen = (length / 2) + 1;
-	ptr = malloc(outLen);
+	ptr = Stream_Read_UTF16_String_As_UTF8(s, length / sizeof(WCHAR), nullptr);
 	if (!ptr)
 		return FALSE;
-	ptr[outLen - 1] = 0;
-
-	WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)Stream_Pointer(s), length, ptr, outLen, NULL, FALSE);
-	Stream_Seek(s, length);
 	*str = ptr;
 	return TRUE;
 }
@@ -489,7 +499,7 @@ BOOL ber_read_octet_string_tag(wStream* s, size_t* length)
 
 BOOL ber_read_octet_string(wStream* s, BYTE** content, size_t* length)
 {
-	BYTE* ret;
+	BYTE* ret = nullptr;
 
 	WINPR_ASSERT(s);
 	WINPR_ASSERT(content);
@@ -511,8 +521,10 @@ BOOL ber_read_octet_string(wStream* s, BYTE** content, size_t* length)
 
 size_t ber_write_octet_string_tag(wStream* s, size_t length)
 {
-	ber_write_universal_tag(s, BER_TAG_OCTET_STRING, FALSE);
-	ber_write_length(s, length);
+	if (ber_write_universal_tag(s, BER_TAG_OCTET_STRING, FALSE) == 0)
+		return 0;
+	if (ber_write_length(s, length) == 0)
+		return 0;
 	return 1 + _ber_sizeof_length(length);
 }
 
@@ -527,37 +539,41 @@ size_t ber_sizeof_contextual_octet_string(size_t length)
 	return ber_sizeof_contextual_tag(ret) + ret;
 }
 
-/**
- * Read a BER BOOLEAN
- * @param s
- * @param value
+/** \brief Read a BER BOOLEAN
+ *
+ * @param s The stream to read from.
+ * @param value A pointer to the value read, must not be nullptr
+ *
+ * \return \b TRUE for success, \b FALSE for any failure
  */
 
 BOOL ber_read_BOOL(wStream* s, BOOL* value)
 {
-	size_t length;
-	BYTE v;
+	size_t length = 0;
+	BYTE v = 0;
 
+	WINPR_ASSERT(value);
 	if (!ber_read_universal_tag(s, BER_TAG_BOOLEAN, FALSE) || !ber_read_length(s, &length))
 		return FALSE;
 
 	if (length != 1)
 	{
-		WLog_WARN(TAG, "short data, got %" PRIuz ", expected %" PRIuz, length, 1);
+		WLog_WARN(TAG, "short data, got %" PRIuz ", expected %u", length, 1u);
 		return FALSE;
 	}
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, 1))
 		return FALSE;
 
 	Stream_Read_UINT8(s, v);
-	*value = (v ? TRUE : FALSE);
+	*value = (v != 0);
 	return TRUE;
 }
 
 /**
  * Write a BER BOOLEAN
- * @param s
- * @param value
+ *
+ * @param s A pointer to the stream to write to
+ * @param value The value to write
  */
 
 void ber_write_BOOL(wStream* s, BOOL value)
@@ -569,7 +585,7 @@ void ber_write_BOOL(wStream* s, BOOL value)
 
 BOOL ber_read_integer(wStream* s, UINT32* value)
 {
-	size_t length;
+	size_t length = 0;
 
 	WINPR_ASSERT(s);
 
@@ -580,7 +596,7 @@ BOOL ber_read_integer(wStream* s, UINT32* value)
 	if (!Stream_CheckAndLogRequiredLength(TAG, s, length))
 		return FALSE;
 
-	if (value == NULL)
+	if (value == nullptr)
 	{
 		// even if we don't care the integer value, check the announced size
 		return Stream_SafeSeek(s, length);
@@ -596,10 +612,10 @@ BOOL ber_read_integer(wStream* s, UINT32* value)
 	}
 	else if (length == 3)
 	{
-		BYTE byte;
+		BYTE byte = 0;
 		Stream_Read_UINT8(s, byte);
 		Stream_Read_UINT16_BE(s, *value);
-		*value += (byte << 16);
+		*value += (byte << 16) & 0xFF0000;
 	}
 	else if (length == 4)
 	{
@@ -612,7 +628,7 @@ BOOL ber_read_integer(wStream* s, UINT32* value)
 	}
 	else
 	{
-		WLog_ERR(TAG, "should implement reading an integer with length=%d", length);
+		WLog_ERR(TAG, "should implement reading an integer with length=%" PRIuz, length);
 		return FALSE;
 	}
 
@@ -621,8 +637,11 @@ BOOL ber_read_integer(wStream* s, UINT32* value)
 
 /**
  * Write a BER INTEGER
- * @param s
- * @param value
+ *
+ * @param s A pointer to the stream to write to
+ * @param value The value to write
+ *
+ * @return The size in bytes that were written
  */
 
 size_t ber_write_integer(wStream* s, UINT32 value)
@@ -631,33 +650,41 @@ size_t ber_write_integer(wStream* s, UINT32 value)
 
 	if (value < 0x80)
 	{
-		ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE);
-		ber_write_length(s, 1);
+		if (ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE) == 0)
+			return 0;
+		if (ber_write_length(s, 1) == 0)
+			return 0;
 
-		Stream_Write_UINT8(s, value);
+		Stream_Write_UINT8(s, WINPR_ASSERTING_INT_CAST(UINT8, value));
 		return 3;
 	}
 	else if (value < 0x8000)
 	{
-		ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE);
-		ber_write_length(s, 2);
+		if (ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE) == 0)
+			return 0;
+		if (ber_write_length(s, 2) == 0)
+			return 0;
 
-		Stream_Write_UINT16_BE(s, value);
+		Stream_Write_UINT16_BE(s, WINPR_ASSERTING_INT_CAST(UINT16, value));
 		return 4;
 	}
 	else if (value < 0x800000)
 	{
-		ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE);
-		ber_write_length(s, 3);
+		if (ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE) == 0)
+			return 0;
+		if (ber_write_length(s, 3) == 0)
+			return 0;
 
-		Stream_Write_UINT8(s, (value >> 16));
-		Stream_Write_UINT16_BE(s, (value & 0xFFFF));
+		Stream_Write_UINT8(s, WINPR_ASSERTING_INT_CAST(UINT8, value >> 16));
+		Stream_Write_UINT16_BE(s, WINPR_ASSERTING_INT_CAST(UINT16, value & 0xFFFF));
 		return 5;
 	}
 	else if (value < 0x80000000)
 	{
-		ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE);
-		ber_write_length(s, 4);
+		if (ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE) == 0)
+			return 0;
+		if (ber_write_length(s, 4) == 0)
+			return 0;
 
 		Stream_Write_UINT32_BE(s, value);
 		return 6;
@@ -665,8 +692,10 @@ size_t ber_write_integer(wStream* s, UINT32 value)
 	else
 	{
 		/* treat as signed integer i.e. NT/HRESULT error codes */
-		ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE);
-		ber_write_length(s, 4);
+		if (ber_write_universal_tag(s, BER_TAG_INTEGER, FALSE) == 0)
+			return 0;
+		if (ber_write_length(s, 4) == 0)
+			return 0;
 
 		Stream_Write_UINT32_BE(s, value);
 		return 6;
@@ -682,7 +711,8 @@ size_t ber_write_contextual_integer(wStream* s, BYTE tag, UINT32 value)
 	WINPR_ASSERT(Stream_EnsureRemainingCapacity(s, len + 5));
 
 	len += ber_write_contextual_tag(s, tag, len, TRUE);
-	ber_write_integer(s, value);
+	if (ber_write_integer(s, value) == 0)
+		return 0;
 	return len;
 }
 

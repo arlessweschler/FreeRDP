@@ -27,15 +27,24 @@
 #include <freerdp/channels/rdpdr.h>
 
 #include <freerdp/log.h>
-#define TAG FREERDP_TAG("utils.scard")
 
 LONG scard_log_status_error(const char* tag, const char* what, LONG status)
+{
+	wLog* log = WLog_Get(tag);
+	return scard_log_status_error_wlog(log, "%s", status, what);
+}
+
+LONG scard_log_status_error_wlog(wLog* log, const char* what, LONG status, ...)
 {
 	if (status != SCARD_S_SUCCESS)
 	{
 		DWORD level = WLOG_ERROR;
 		switch (status)
 		{
+			case SCARD_W_RESET_CARD:
+			case SCARD_E_NOT_TRANSACTED:
+			case SCARD_E_CANCELLED:
+			case SCARD_E_UNSUPPORTED_FEATURE:
 			case SCARD_E_TIMEOUT:
 				level = WLOG_DEBUG;
 				break;
@@ -45,8 +54,16 @@ LONG scard_log_status_error(const char* tag, const char* what, LONG status)
 			default:
 				break;
 		}
-		WLog_Print(WLog_Get(tag), level, "%s failed with error %s [%" PRId32 "]", what,
+
+		char* str = nullptr;
+		size_t slen = 0;
+		va_list ap = WINPR_C_ARRAY_INIT;
+		va_start(ap, status);
+		winpr_vasprintf(&str, &slen, what, ap);
+		va_end(ap);
+		WLog_Print(log, level, "%s failed with error %s [%" PRId32 "]", str,
 		           SCardGetErrorString(status), status);
+		free(str);
 	}
 	return status;
 }
@@ -253,117 +270,260 @@ const char* rdpdr_packetid_string(UINT16 packetid)
 }
 
 BOOL rdpdr_write_iocompletion_header(wStream* out, UINT32 DeviceId, UINT32 CompletionId,
-                                     UINT32 ioStatus)
+                                     NTSTATUS ioStatus)
 {
 	WINPR_ASSERT(out);
-	Stream_SetPosition(out, 0);
+	Stream_ResetPosition(out);
 	if (!Stream_EnsureRemainingCapacity(out, 16))
 		return FALSE;
+
 	Stream_Write_UINT16(out, RDPDR_CTYP_CORE);                /* Component (2 bytes) */
 	Stream_Write_UINT16(out, PAKID_CORE_DEVICE_IOCOMPLETION); /* PacketId (2 bytes) */
 	Stream_Write_UINT32(out, DeviceId);                       /* DeviceId (4 bytes) */
 	Stream_Write_UINT32(out, CompletionId);                   /* CompletionId (4 bytes) */
-	Stream_Write_UINT32(out, ioStatus);                       /* IoStatus (4 bytes) */
+	Stream_Write_INT32(out, ioStatus);                        /* IoStatus (4 bytes) */
 
 	return TRUE;
 }
 
-void rdpdr_dump_received_packet(wStream* s, const char* custom)
+static void rdpdr_dump_packet(wLog* log, DWORD lvl, wStream* s, const char* custom, BOOL send)
 {
+	if (!WLog_IsLevelActive(log, lvl))
+		return;
+
 	const size_t gpos = Stream_GetPosition(s);
-	Stream_SetPosition(s, 0);
-	if (Stream_Length(s) >= 4)
-	{
-		BOOL done = FALSE;
-		UINT16 component, packetid;
-		UINT32 deviceID = 0;
-		UINT32 FileId = 0;
-		UINT32 CompletionId = 0;
-		UINT32 MajorFunction = 0;
-		UINT32 MinorFunction = 0;
-		const size_t pos = Stream_GetPosition(s);
-		wLog* log = WLog_Get(TAG);
+	const size_t pos = send ? Stream_GetPosition(s) : Stream_Length(s);
 
+	UINT16 component = 0;
+	UINT16 packetid = 0;
+
+	Stream_ResetPosition(s);
+
+	if (pos >= 2ull)
 		Stream_Read_UINT16(s, component);
+	if (pos >= 4ull)
 		Stream_Read_UINT16(s, packetid);
-		if (Stream_GetRemainingLength(s) >= 4)
-			Stream_Read_UINT32(s, deviceID);
-		if (component == RDPDR_CTYP_CORE)
-		{
-			if (packetid == PAKID_CORE_DEVICE_IOREQUEST)
-			{
-				if (Stream_GetRemainingLength(s) >= 16)
-				{
-					Stream_Read_UINT32(s, FileId);        /* FileId (4 bytes) */
-					Stream_Read_UINT32(s, CompletionId);  /* CompletionId (4 bytes) */
-					Stream_Read_UINT32(s, MajorFunction); /* MajorFunction (4 bytes) */
-					Stream_Read_UINT32(s, MinorFunction); /* MinorFunction (4 bytes) */
 
-					WLog_Print(log, WLOG_DEBUG,
-					           "[%s] receive [%s | %s] [0x%08" PRIx32 "] FileID=0x%08" PRIx32
-					           ", CompletionID=0x%08" PRIx32 ", MajorFunction=%s [0x%08" PRIx32
-					           "] -> %" PRIuz,
-					           custom, rdpdr_component_string(component),
-					           rdpdr_packetid_string(packetid), deviceID, FileId, CompletionId,
-					           rdpdr_irp_string(MajorFunction), MinorFunction, deviceID,
-					           Stream_Length(s));
-					done = TRUE;
-				}
-			}
-		}
-		Stream_SetPosition(s, pos);
-
-		if (!done)
+	switch (packetid)
+	{
+		case PAKID_CORE_SERVER_ANNOUNCE:
+		case PAKID_CORE_CLIENTID_CONFIRM:
 		{
-			WLog_Print(log, WLOG_DEBUG, "[%s] receive [%s | %s] [0x%08" PRIx32 "] -> %" PRIuz,
+			UINT16 versionMajor = 0;
+			UINT16 versionMinor = 0;
+			UINT32 clientID = 0;
+
+			if (pos >= 6ull)
+				Stream_Read_UINT16(s, versionMajor);
+			if (pos >= 8ull)
+				Stream_Read_UINT16(s, versionMinor);
+			if (pos >= 12ull)
+				Stream_Read_UINT32(s, clientID);
+			WLog_Print(log, lvl,
+			           "%s [%s | %s] [version:%" PRIu16 ".%" PRIu16 "][id:0x%08" PRIx32
+			           "] -> %" PRIuz,
 			           custom, rdpdr_component_string(component), rdpdr_packetid_string(packetid),
-			           deviceID, Stream_Length(s));
+			           versionMajor, versionMinor, clientID, pos);
 		}
-		winpr_HexLogDump(log, WLOG_TRACE, Stream_Buffer(s), Stream_Length(s));
-	}
-
-	Stream_SetPosition(s, gpos);
-}
-
-void rdpdr_dump_send_packet(wStream* s, const char* custom)
-{
-	WINPR_ASSERT(s);
-
-	if (Stream_Length(s) >= 8)
-	{
-		UINT16 component, packetid;
-		UINT32 deviceID;
-		const size_t pos = Stream_GetPosition(s);
-		Stream_SetPosition(s, 0);
-
-		Stream_Read_UINT16(s, component);
-		Stream_Read_UINT16(s, packetid);
-		Stream_Read_UINT32(s, deviceID);
-		switch (packetid)
+		break;
+		case PAKID_CORE_CLIENT_NAME:
 		{
-			case PAKID_CORE_DEVICE_IOCOMPLETION:
+			char name[256] = WINPR_C_ARRAY_INIT;
+			UINT32 unicodeFlag = 0;
+			UINT32 codePage = 0;
+			UINT32 computerNameLen = 0;
+			if (pos >= 8ull)
+				Stream_Read_UINT32(s, unicodeFlag);
+			if (pos >= 12ull)
+				Stream_Read_UINT32(s, codePage);
+			if (pos >= 16ull)
+				Stream_Read_UINT32(s, computerNameLen);
+			if (pos >= 16ull + computerNameLen)
 			{
-				UINT32 completionID, ioStatus;
+				if (unicodeFlag == 0)
+					Stream_Read(s, name, MIN(sizeof(name), computerNameLen));
+				else
+					(void)ConvertWCharNToUtf8(Stream_ConstPointer(s),
+					                          computerNameLen / sizeof(WCHAR), name, sizeof(name));
+			}
+			WLog_Print(log, lvl,
+			           "%s [%s | %s] [ucs:%" PRIu32 "|cp:%" PRIu32 "][len:0x%08" PRIx32
+			           "] '%s' -> %" PRIuz,
+			           custom, rdpdr_component_string(component), rdpdr_packetid_string(packetid),
+			           unicodeFlag, codePage, computerNameLen, name, pos);
+		}
+		break;
+
+		case PAKID_CORE_DEVICE_IOREQUEST:
+		{
+			UINT32 CompletionId = 0;
+			UINT32 deviceID = 0;
+			UINT32 FileId = 0;
+			UINT32 MajorFunction = 0;
+			UINT32 MinorFunction = 0;
+
+			if (pos >= 8ull)
+				Stream_Read_UINT32(s, deviceID);
+			if (pos >= 12ull)
+				Stream_Read_UINT32(s, FileId);
+			if (pos >= 16ull)
+				Stream_Read_UINT32(s, CompletionId);
+			if (pos >= 20ull)
+				Stream_Read_UINT32(s, MajorFunction);
+			if (pos >= 24ull)
+				Stream_Read_UINT32(s, MinorFunction);
+			WLog_Print(log, lvl,
+			           "%s [%s | %s] [0x%08" PRIx32 "] FileId=0x%08" PRIx32
+			           ", CompletionId=0x%08" PRIx32 ", MajorFunction=0x%08" PRIx32
+			           ", MinorFunction=0x%08" PRIx32 " -> %" PRIuz,
+			           custom, rdpdr_component_string(component), rdpdr_packetid_string(packetid),
+			           deviceID, FileId, CompletionId, MajorFunction, MinorFunction, pos);
+		}
+		break;
+		case PAKID_CORE_DEVICE_IOCOMPLETION:
+		{
+			UINT32 completionID = 0;
+			UINT32 ioStatus = 0;
+			UINT32 deviceID = 0;
+			if (pos >= 8ull)
+				Stream_Read_UINT32(s, deviceID);
+			if (pos >= 12ull)
 				Stream_Read_UINT32(s, completionID);
+			if (pos >= 16ull)
 				Stream_Read_UINT32(s, ioStatus);
 
-				WLog_DBG(TAG,
-				         "[%s] sending [%s | %s] [0x%08" PRIx32 "] completionID=0x%08" PRIx32
-				         ", ioStatus=0x%08" PRIx32 " -> %" PRIuz,
-				         custom, rdpdr_component_string(component), rdpdr_packetid_string(packetid),
-				         deviceID, completionID, ioStatus, pos);
-			}
-			break;
-			default:
-				WLog_DBG(TAG, "[%s] sending [%s | %s] [0x%08" PRIx32 "] -> %" PRIuz, custom,
-				         rdpdr_component_string(component), rdpdr_packetid_string(packetid),
-				         deviceID, pos);
-				break;
+			WLog_Print(log, lvl,
+			           "%s [%s | %s] [0x%08" PRIx32 "] completionID=0x%08" PRIx32
+			           ", ioStatus=0x%08" PRIx32 " -> %" PRIuz,
+			           custom, rdpdr_component_string(component), rdpdr_packetid_string(packetid),
+			           deviceID, completionID, ioStatus, pos);
 		}
+		break;
+		case PAKID_CORE_DEVICE_REPLY:
+		{
+			UINT32 deviceID = 0;
+			UINT32 status = 0;
 
-		winpr_HexDump(TAG, WLOG_TRACE, Stream_Buffer(s), pos);
-		Stream_SetPosition(s, pos);
+			if (pos >= 8ull)
+				Stream_Read_UINT32(s, deviceID);
+			if (pos >= 12ull)
+				Stream_Read_UINT32(s, status);
+			WLog_Print(log, lvl,
+			           "%s [%s | %s] [id:0x%08" PRIx32 ",status=0x%08" PRIx32 "] -> %" PRIuz,
+			           custom, rdpdr_component_string(component), rdpdr_packetid_string(packetid),
+			           deviceID, status, pos);
+		}
+		break;
+		case PAKID_CORE_CLIENT_CAPABILITY:
+		case PAKID_CORE_SERVER_CAPABILITY:
+		{
+			UINT16 numCapabilities = 0;
+			if (pos >= 6ull)
+				Stream_Read_UINT16(s, numCapabilities);
+			if (pos >= 8ull)
+				Stream_Seek_UINT16(s); /* padding */
+			WLog_Print(log, lvl, "%s [%s | %s] [caps:%" PRIu16 "] -> %" PRIuz, custom,
+			           rdpdr_component_string(component), rdpdr_packetid_string(packetid),
+			           numCapabilities, pos);
+			for (UINT16 x = 0; x < numCapabilities; x++)
+			{
+				RDPDR_CAPABILITY_HEADER header = WINPR_C_ARRAY_INIT;
+				const UINT error = rdpdr_read_capset_header(log, s, &header);
+				if (error == CHANNEL_RC_OK)
+					Stream_Seek(s, header.CapabilityLength);
+			}
+		}
+		break;
+		case PAKID_CORE_DEVICELIST_ANNOUNCE:
+		{
+			size_t offset = 8;
+			UINT32 count = 0;
+
+			if (pos >= offset)
+				Stream_Read_UINT32(s, count);
+
+			WLog_Print(log, lvl, "%s [%s | %s] [%" PRIu32 "] -> %" PRIuz, custom,
+			           rdpdr_component_string(component), rdpdr_packetid_string(packetid), count,
+			           pos);
+
+			for (UINT32 x = 0; x < count; x++)
+			{
+				RdpdrDevice device = WINPR_C_ARRAY_INIT;
+
+				offset += 20ull;
+				if (pos >= offset)
+				{
+					Stream_Read_UINT32(s, device.DeviceType);       /* DeviceType (4 bytes) */
+					Stream_Read_UINT32(s, device.DeviceId);         /* DeviceId (4 bytes) */
+					Stream_Read(
+					    s, device.PreferredDosName,
+					    ARRAYSIZE(device.PreferredDosName));        /* PreferredDosName (8 bytes) */
+					Stream_Read_UINT32(s, device.DeviceDataLength); /* DeviceDataLength (4 bytes) */
+					if (!Stream_CheckAndLogRequiredLengthWLog(log, s, device.DeviceDataLength))
+						return;
+
+					device.DeviceData = Stream_Pointer(s);
+					Stream_Seek(s, device.DeviceDataLength);
+				}
+				offset += device.DeviceDataLength;
+
+				WLog_Print(log, lvl,
+				           "%s [announce][%" PRIu32 "] %s [0x%08" PRIx32
+				           "] '%s' [DeviceDataLength=%" PRIu32 "]",
+				           custom, x, freerdp_rdpdr_dtyp_string(device.DeviceType), device.DeviceId,
+				           device.PreferredDosName, device.DeviceDataLength);
+			}
+		}
+		break;
+		case PAKID_CORE_DEVICELIST_REMOVE:
+		{
+			size_t offset = 8;
+			UINT32 count = 0;
+
+			if (pos >= offset)
+				Stream_Read_UINT32(s, count);
+
+			WLog_Print(log, lvl, "%s [%s | %s] [%" PRIu32 "] -> %" PRIuz, custom,
+			           rdpdr_component_string(component), rdpdr_packetid_string(packetid), count,
+			           pos);
+
+			for (UINT32 x = 0; x < count; x++)
+			{
+				UINT32 id = 0;
+
+				offset += 4ull;
+				if (pos >= offset)
+					Stream_Read_UINT32(s, id);
+
+				WLog_Print(log, lvl, "%s [remove][%" PRIu32 "] id=%" PRIu32, custom, x, id);
+			}
+		}
+		break;
+		case PAKID_CORE_USER_LOGGEDON:
+			WLog_Print(log, lvl, "%s [%s | %s] -> %" PRIuz, custom,
+			           rdpdr_component_string(component), rdpdr_packetid_string(packetid), pos);
+			break;
+		default:
+		{
+			WLog_Print(log, lvl, "%s [%s | %s] -> %" PRIuz, custom,
+			           rdpdr_component_string(component), rdpdr_packetid_string(packetid), pos);
+		}
+		break;
 	}
+
+	// winpr_HexLogDump(log, lvl, Stream_Buffer(s), pos);
+	if (!Stream_SetPosition(s, gpos))
+		WLog_Print(log, WLOG_ERROR, "Stream_SetPosition(%" PRIuz ") failed", gpos);
+}
+
+void rdpdr_dump_received_packet(wLog* log, DWORD lvl, wStream* out, const char* custom)
+{
+	rdpdr_dump_packet(log, lvl, out, custom, FALSE);
+}
+
+void rdpdr_dump_send_packet(wLog* log, DWORD lvl, wStream* out, const char* custom)
+{
+	rdpdr_dump_packet(log, lvl, out, custom, TRUE);
 }
 
 const char* rdpdr_irp_string(UINT32 major)
@@ -413,5 +573,136 @@ const char* rdpdr_cap_type_string(UINT16 capability)
 			return "CAP_SMARTCARD_TYPE";
 		default:
 			return "CAP_UNKNOWN";
+	}
+}
+
+UINT rdpdr_read_capset_header(wLog* log, wStream* s, RDPDR_CAPABILITY_HEADER* header)
+{
+	WINPR_ASSERT(header);
+	if (!Stream_CheckAndLogRequiredLengthWLog(log, s, 8))
+		return ERROR_INVALID_DATA;
+
+	Stream_Read_UINT16(s, header->CapabilityType);   /* CapabilityType (2 bytes) */
+	Stream_Read_UINT16(s, header->CapabilityLength); /* CapabilityLength (2 bytes) */
+	Stream_Read_UINT32(s, header->Version);          /* Version (4 bytes) */
+
+	WLog_Print(log, WLOG_TRACE,
+	           "capability %s [0x%04" PRIx16 "] got version %" PRIu32 ", length %" PRIu16,
+	           rdpdr_cap_type_string(header->CapabilityType), header->CapabilityType,
+	           header->Version, header->CapabilityLength);
+	if (header->CapabilityLength < 8)
+	{
+		WLog_Print(log, WLOG_ERROR, "capability %s got short length %" PRIu32,
+		           rdpdr_cap_type_string(header->CapabilityType), header->CapabilityLength);
+		return ERROR_INVALID_DATA;
+	}
+	header->CapabilityLength -= 8;
+	if (!Stream_CheckAndLogRequiredLengthWLog(log, s, header->CapabilityLength))
+		return ERROR_INVALID_DATA;
+	return CHANNEL_RC_OK;
+}
+
+UINT rdpdr_write_capset_header(wLog* log, wStream* s, const RDPDR_CAPABILITY_HEADER* header)
+{
+	WINPR_ASSERT(header);
+	WINPR_ASSERT(header->CapabilityLength >= 8);
+
+	if (!Stream_EnsureRemainingCapacity(s, header->CapabilityLength))
+	{
+		WLog_Print(log, WLOG_ERROR, "not enough data in stream!");
+		return ERROR_INVALID_DATA;
+	}
+
+	WLog_Print(log, WLOG_TRACE, "writing capability %s version %" PRIu32 ", length %" PRIu16,
+	           rdpdr_cap_type_string(header->CapabilityType), header->Version,
+	           header->CapabilityLength);
+	Stream_Write_UINT16(s, header->CapabilityType);   /* CapabilityType (2 bytes) */
+	Stream_Write_UINT16(s, header->CapabilityLength); /* CapabilityLength (2 bytes) */
+	Stream_Write_UINT32(s, header->Version);          /* Version (4 bytes) */
+	return CHANNEL_RC_OK;
+}
+
+const char* rdpdr_irp_val2str(UINT32 ioCode1)
+{
+	switch (ioCode1)
+	{
+		case RDPDR_IRP_MJ_CREATE:
+			return "MJ_CREATE";
+		case RDPDR_IRP_MJ_CLEANUP:
+			return "MJ_CLEANUP";
+		case RDPDR_IRP_MJ_CLOSE:
+			return "MJ_CLOSE";
+		case RDPDR_IRP_MJ_READ:
+			return "MJ_READ";
+		case RDPDR_IRP_MJ_WRITE:
+			return "MJ_WRITE";
+		case RDPDR_IRP_MJ_FLUSH_BUFFERS:
+			return "MJ_FLUSH_BUFFERS";
+		case RDPDR_IRP_MJ_SHUTDOWN:
+			return "MJ_SHUTDOWN";
+		case RDPDR_IRP_MJ_DEVICE_CONTROL:
+			return "MJ_DEVICE_CONTROL";
+		case RDPDR_IRP_MJ_QUERY_VOLUME_INFORMATION:
+			return "MJ_QUERY_VOLUME_INFORMATION";
+		case RDPDR_IRP_MJ_SET_VOLUME_INFORMATION:
+			return "MJ_SET_VOLUME_INFORMATION";
+		case RDPDR_IRP_MJ_QUERY_INFORMATION:
+			return "MJ_QUERY_INFORMATION";
+		case RDPDR_IRP_MJ_SET_INFORMATION:
+			return "MJ_SET_INFORMATION";
+		case RDPDR_IRP_MJ_DIRECTORY_CONTROL:
+			return "MJ_DIRECTORY_CONTROL";
+		case RDPDR_IRP_MJ_LOCK_CONTROL:
+			return "MJ_LOCK_CONTROL";
+		case RDPDR_IRP_MJ_QUERY_SECURITY:
+			return "MJ_QUERY_SECURITY";
+		case RDPDR_IRP_MJ_SET_SECURITY:
+			return "MJ_SET_SECURITY";
+		default:
+			return "IRP_MJ_UNKNOWN";
+	}
+}
+
+const char* rdpdr_irp_mask2str(UINT32 ioCode1Mask, char* buffer, size_t len)
+{
+	if (len < 1)
+		return nullptr;
+
+	if (!winpr_str_append("{", buffer, len, nullptr))
+		return nullptr;
+
+	for (size_t x = 0; x < 32; x++)
+	{
+		const UINT32 mask = (1u << x);
+		if (ioCode1Mask & mask)
+		{
+			if (!winpr_str_append(rdpdr_irp_val2str(mask), &buffer[1], len - 1, "|"))
+				return nullptr;
+		}
+	}
+
+	char number[16] = WINPR_C_ARRAY_INIT;
+	(void)_snprintf(number, sizeof(number), "}[0x%08" PRIx32 "]", ioCode1Mask);
+	if (!winpr_str_append(number, buffer, len, nullptr))
+		return nullptr;
+	return buffer;
+}
+
+const char* rdpdr_device_type_string(UINT32 type)
+{
+	switch (type)
+	{
+		case RDPDR_DTYP_SERIAL:
+			return "serial";
+		case RDPDR_DTYP_PRINT:
+			return "printer";
+		case RDPDR_DTYP_FILESYSTEM:
+			return "drive";
+		case RDPDR_DTYP_SMARTCARD:
+			return "smartcard";
+		case RDPDR_DTYP_PARALLEL:
+			return "parallel";
+		default:
+			return "UNKNOWN";
 	}
 }

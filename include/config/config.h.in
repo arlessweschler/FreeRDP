@@ -4,26 +4,32 @@
 #include <winpr/config.h>
 
 /* Include files */
-#cmakedefine HAVE_SYSLOG_H
-#cmakedefine HAVE_JOURNALD_H
-#cmakedefine HAVE_VALGRIND_MEMCHECK_H
+#cmakedefine FREERDP_HAVE_VALGRIND_MEMCHECK_H
 
 /* Features */
 #cmakedefine SWRESAMPLE_FOUND
 #cmakedefine AVRESAMPLE_FOUND
 
 /* Options */
+/** If set the rdpSettings struct is opaque and internals can only be accessed
+ *  through getters/setters
+ *
+ *  \since version 3.0.0
+ */
+#cmakedefine WITH_OPAQUE_SETTINGS
+
 #cmakedefine WITH_ADD_PLUGIN_TO_RPATH
 #cmakedefine WITH_PROFILER
 #cmakedefine WITH_GPROF
-#cmakedefine WITH_SSE2
-#cmakedefine WITH_NEON
-#cmakedefine WITH_IPP
+#cmakedefine WITH_SIMD
+#cmakedefine WITH_AVX2
 #cmakedefine WITH_CUPS
 #cmakedefine WITH_JPEG
 #cmakedefine WITH_WIN8
+#cmakedefine WITH_AAD
 #cmakedefine WITH_CAIRO
 #cmakedefine WITH_SWSCALE
+#cmakedefine WITH_SWSCALE_LOADING
 #cmakedefine WITH_RDPSND_DSOUND
 
 #cmakedefine WITH_WINMM
@@ -33,8 +39,15 @@
 #cmakedefine WITH_PULSE
 #cmakedefine WITH_IOSAUDIO
 #cmakedefine WITH_OPENSLES
+#cmakedefine WITH_AAUDIO
+#cmakedefine WITH_SDL_AUDIO
 #cmakedefine WITH_GSM
 #cmakedefine WITH_LAME
+/** If defined Opus codec support is available.
+ *
+ *  \since version 3.0.0
+ */
+#cmakedefine WITH_OPUS
 #cmakedefine WITH_FAAD2
 #cmakedefine WITH_FAAC
 #cmakedefine WITH_SOXR
@@ -42,13 +55,24 @@
 #cmakedefine WITH_OPENH264
 #cmakedefine WITH_OPENH264_LOADING
 #cmakedefine WITH_VIDEO_FFMPEG
+#cmakedefine WITH_APPLE_VIDEOTOOLBOX
+#cmakedefine WITH_H264_WEBCODECS
 #cmakedefine WITH_DSP_EXPERIMENTAL
 #cmakedefine WITH_DSP_FFMPEG
 #cmakedefine WITH_OPENCL
 #cmakedefine WITH_MEDIA_FOUNDATION
 #cmakedefine WITH_MEDIACODEC
+#cmakedefine WITH_GFX_AV1
+#cmakedefine WITH_GFX_AV2
+#cmakedefine WITH_GFX_AV2_I444
+#cmakedefine WITH_GFX_AZURE
+#cmakedefine WITH_RDPEUDP
 
-#cmakedefine WITH_VAAPI
+#cmakedefine WITH_FFMPEG_HWACCEL
+
+#cmakedefine WITH_CHANNELS
+#cmakedefine WITH_CLIENT_CHANNELS
+#cmakedefine WITH_SERVER_CHANNELS
 
 #cmakedefine WITH_CHANNEL_GFXREDIR
 #cmakedefine WITH_CHANNEL_RDPAPPLIST
@@ -75,6 +99,7 @@
 #cmakedefine CHANNEL_DRIVE
 #cmakedefine CHANNEL_DRIVE_CLIENT
 #cmakedefine CHANNEL_DRIVE_SERVER
+
 #cmakedefine CHANNEL_ECHO
 #cmakedefine CHANNEL_ECHO_CLIENT
 #cmakedefine CHANNEL_ECHO_SERVER
@@ -87,6 +112,21 @@
 #cmakedefine CHANNEL_GFXREDIR
 #cmakedefine CHANNEL_GFXREDIR_CLIENT
 #cmakedefine CHANNEL_GFXREDIR_SERVER
+/** If defined location channel support is available.
+ *
+ *  \since version 3.0.0
+ */
+#cmakedefine CHANNEL_LOCATION
+/** If defined location client side channel support is available.
+ *
+ *  \since version 3.0.0
+ */
+#cmakedefine CHANNEL_LOCATION_CLIENT
+/** If defined location server side channel support is available.
+ *
+ *  \since version 3.0.0
+ */
+#cmakedefine CHANNEL_LOCATION_SERVER
 #cmakedefine CHANNEL_PARALLEL
 #cmakedefine CHANNEL_PARALLEL_CLIENT
 #cmakedefine CHANNEL_PARALLEL_SERVER
@@ -105,12 +145,35 @@
 #cmakedefine CHANNEL_RDPECAM
 #cmakedefine CHANNEL_RDPECAM_CLIENT
 #cmakedefine CHANNEL_RDPECAM_SERVER
+#cmakedefine CHANNEL_RDPEAR
+#cmakedefine CHANNEL_RDPEAR_CLIENT
+#cmakedefine CHANNEL_RDPEAR_SERVER
+#cmakedefine CHANNEL_RDPEWA
+#cmakedefine CHANNEL_RDPEWA_CLIENT
+#cmakedefine CHANNEL_RDPEWA_SERVER
 #cmakedefine CHANNEL_RDPEI
 #cmakedefine CHANNEL_RDPEI_CLIENT
 #cmakedefine CHANNEL_RDPEI_SERVER
 #cmakedefine CHANNEL_RDPGFX
 #cmakedefine CHANNEL_RDPGFX_CLIENT
 #cmakedefine CHANNEL_RDPGFX_SERVER
+/** If defined mouse cursor channel support is available.
+ *
+ *  \since version 3.0.0
+ */
+#cmakedefine CHANNEL_RDPEMSC
+
+/** If defined mouse cursor channel support is available.
+ *
+ *  \since version 3.0.0
+ */
+#cmakedefine CHANNEL_RDPEMSC_CLIENT
+
+/** If defined mouse cursor channel support is available.
+ *
+ *  \since version 3.0.0
+ */
+#cmakedefine CHANNEL_RDPEMSC_SERVER
 #cmakedefine CHANNEL_RDPSND
 #cmakedefine CHANNEL_RDPSND_CLIENT
 #cmakedefine CHANNEL_RDPSND_SERVER
@@ -144,6 +207,7 @@
 #cmakedefine WITH_DEBUG_CAPABILITIES
 #cmakedefine WITH_DEBUG_CHANNELS
 #cmakedefine WITH_DEBUG_CLIPRDR
+#cmakedefine WITH_DEBUG_CODECS
 #cmakedefine WITH_DEBUG_RDPGFX
 #cmakedefine WITH_DEBUG_DVC
 #cmakedefine WITH_DEBUG_TSMF
@@ -165,14 +229,39 @@
 #cmakedefine WITH_DEBUG_URBDRC
 #cmakedefine WITH_DEBUG_TRANSPORT
 #cmakedefine WITH_DEBUG_WND
-#cmakedefine WITH_DEBUG_X11
-#cmakedefine WITH_DEBUG_X11_CLIPRDR
-#cmakedefine WITH_DEBUG_X11_LOCAL_MOVESIZE
-#cmakedefine WITH_DEBUG_XV
 #cmakedefine WITH_DEBUG_RINGBUFFER
 
 /* Proxy */
 #cmakedefine WITH_PROXY_MODULES
 #cmakedefine WITH_PROXY_EMULATE_SMARTCARD
+
+/** If defined linux/vm_sockets.h support is available.
+ *
+ *  \since version 3.0.0
+ */
+#cmakedefine HAVE_AF_VSOCK_H
+
+/** If library is build without these do permanently hide symbols
+ *
+ * \since version 3.17.2
+ */
+#if !defined(WITHOUT_FREERDP_3x_DEPRECATED)
+#cmakedefine WITHOUT_FREERDP_3x_DEPRECATED
+#endif
+
+/** Build FILE_DIRECTORY_INFORMATION::FileName with type WCHAR instead of char
+ *
+ * @since version 3.20.0
+ */
+#cmakedefine WITH_WCHAR_FILE_DIRECTORY_INFORMATION
+
+/** Enforce the TLS AEAD cryptographic data limit (RFC 8446 §5.5): on a TLS 1.3
+ *  connection the traffic keys are rekeyed in place once a per-direction byte
+ *  threshold is reached; if the rekey fails the connection is cut. On non-TLS-1.3
+ *  connections a rekey is not possible and the connection is left as is. When
+ *  undefined the whole feature is compiled out.
+ * @since version 3.31.0
+ */
+#cmakedefine WITH_TLS_DATA_LIMIT
 
 #endif /* FREERDP_CONFIG_H */

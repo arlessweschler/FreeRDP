@@ -13,14 +13,13 @@ static DWORD WINAPI test_thread(LPVOID arg)
 
 int TestSynchThread(int argc, char* argv[])
 {
-	DWORD rc;
-	HANDLE thread;
-	int i;
+	DWORD rc = 0;
+	HANDLE thread = nullptr;
 
 	WINPR_UNUSED(argc);
 	WINPR_UNUSED(argv);
 
-	thread = CreateThread(NULL, 0, test_thread, NULL, 0, NULL);
+	thread = CreateThread(nullptr, 0, test_thread, nullptr, 0, nullptr);
 
 	if (!thread)
 	{
@@ -56,7 +55,7 @@ int TestSynchThread(int argc, char* argv[])
 	}
 
 	/* check that WaitForSingleObject works multiple times on a terminated thread */
-	for (i = 0; i < 4; i++)
+	for (int i = 0; i < 4; i++)
 	{
 		rc = WaitForSingleObject(thread, 0);
 		if (WAIT_OBJECT_0 != rc)
@@ -72,7 +71,7 @@ int TestSynchThread(int argc, char* argv[])
 		return -1;
 	}
 
-	thread = CreateThread(NULL, 0, test_thread, NULL, 0, NULL);
+	thread = CreateThread(nullptr, 0, test_thread, nullptr, 0, nullptr);
 
 	if (!thread)
 	{
@@ -114,7 +113,7 @@ int TestSynchThread(int argc, char* argv[])
 	}
 
 	/* Thread detach test */
-	thread = CreateThread(NULL, 0, test_thread, NULL, 0, NULL);
+	thread = CreateThread(nullptr, 0, test_thread, nullptr, 0, nullptr);
 
 	if (!thread)
 	{

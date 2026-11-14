@@ -20,6 +20,7 @@
 #define RDTK_RESOURCES_PRIVATE_H
 
 #include <stdint.h>
+#include <winpr/wtypes.h>
 #include <rdtk/rdtk.h>
 
 #include "rdtk_engine.h"
@@ -29,6 +30,7 @@ extern "C"
 {
 #endif
 
+	WINPR_ATTR_NODISCARD
 	SSIZE_T rdtk_get_embedded_resource_file(const char* filename, const uint8_t** pData);
 
 #ifdef __cplusplus

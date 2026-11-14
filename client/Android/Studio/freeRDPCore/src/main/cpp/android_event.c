@@ -15,62 +15,110 @@
 #include <winpr/crt.h>
 
 #include <freerdp/freerdp.h>
+#include <freerdp/client.h>
+#include <freerdp/input.h>
 #include <freerdp/log.h>
 
 #define TAG CLIENT_TAG("android")
 
-#ifdef HAVE_UNISTD_H
-#include <unistd.h>
-#endif
-
 #include "android_freerdp.h"
 #include "android_cliprdr.h"
 
+/* Merges a pure move into a pure move still waiting at the tail of the queue */
+WINPR_ATTR_NODISCARD
+static BOOL android_coalesce_cursor_move(ANDROID_EVENT_QUEUE* queue, const ANDROID_EVENT* event)
+{
+	WINPR_ASSERT(queue);
+	WINPR_ASSERT(event);
+
+	if ((queue->count < 1) || (event->type != EVENT_TYPE_CURSOR))
+		return FALSE;
+
+	const ANDROID_EVENT_CURSOR* cursor = (const ANDROID_EVENT_CURSOR*)event;
+	if (cursor->flags != PTR_FLAGS_MOVE)
+		return FALSE;
+
+	ANDROID_EVENT* last = queue->events[queue->count - 1];
+	if (!last || (last->type != EVENT_TYPE_CURSOR))
+		return FALSE;
+
+	ANDROID_EVENT_CURSOR* lastCursor = (ANDROID_EVENT_CURSOR*)last;
+	if (lastCursor->flags != PTR_FLAGS_MOVE)
+		return FALSE;
+
+	lastCursor->x = cursor->x;
+	lastCursor->y = cursor->y;
+	return TRUE;
+}
+
 BOOL android_push_event(freerdp* inst, ANDROID_EVENT* event)
 {
+	if (!inst || !inst->context || !event)
+		return FALSE;
+
 	androidContext* aCtx = (androidContext*)inst->context;
+	ANDROID_EVENT_QUEUE* queue = aCtx->event_queue;
+	if (!queue)
+		return FALSE;
 
-	if (aCtx->event_queue->count >= aCtx->event_queue->size)
+	EnterCriticalSection(&queue->lock);
+
+	if (android_coalesce_cursor_move(queue, event))
 	{
-		int new_size;
-		void* new_events;
-		new_size = aCtx->event_queue->size * 2;
-		new_events = realloc((void*)aCtx->event_queue->events, sizeof(ANDROID_EVENT*) * new_size);
-
-		if (!new_events)
-			return FALSE;
-
-		aCtx->event_queue->events = new_events;
-		aCtx->event_queue->size = new_size;
+		/* the queued move is still pending, no need to signal */
+		LeaveCriticalSection(&queue->lock);
+		android_event_free(event);
+		return TRUE;
 	}
 
-	aCtx->event_queue->events[(aCtx->event_queue->count)++] = event;
-	return SetEvent(aCtx->event_queue->isSet);
+	if (queue->count >= queue->size)
+	{
+		size_t new_size = queue->size;
+		do
+		{
+			if (new_size >= SIZE_MAX - 128ull)
+			{
+				LeaveCriticalSection(&queue->lock);
+				return FALSE;
+			}
+
+			new_size += 128ull;
+		} while (new_size <= queue->count);
+		void* new_events = realloc((void*)queue->events, sizeof(ANDROID_EVENT*) * new_size);
+
+		if (!new_events)
+		{
+			LeaveCriticalSection(&queue->lock);
+			return FALSE;
+		}
+
+		queue->events = (ANDROID_EVENT**)new_events;
+		queue->size = new_size;
+	}
+
+	queue->events[queue->count++] = event;
+	LeaveCriticalSection(&queue->lock);
+
+	/* the queue owns the event now, the caller must not free it */
+	if (!SetEvent(queue->isSet))
+		WLog_WARN(TAG, "SetEvent failed");
+	return TRUE;
 }
 
-static ANDROID_EVENT* android_peek_event(ANDROID_EVENT_QUEUE* queue)
-{
-	ANDROID_EVENT* event;
-
-	if (queue->count < 1)
-		return NULL;
-
-	event = queue->events[0];
-	return event;
-}
-
+WINPR_ATTR_NODISCARD
 static ANDROID_EVENT* android_pop_event(ANDROID_EVENT_QUEUE* queue)
 {
-	int i;
-	ANDROID_EVENT* event;
+	ANDROID_EVENT* event = nullptr;
+
+	WINPR_ASSERT(queue);
 
 	if (queue->count < 1)
-		return NULL;
+		return nullptr;
 
 	event = queue->events[0];
 	(queue->count)--;
 
-	for (i = 0; i < queue->count; i++)
+	for (size_t i = 0; i < queue->count; i++)
 	{
 		queue->events[i] = queue->events[i + 1];
 	}
@@ -78,6 +126,7 @@ static ANDROID_EVENT* android_pop_event(ANDROID_EVENT_QUEUE* queue)
 	return event;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL android_process_event(ANDROID_EVENT_QUEUE* queue, freerdp* inst)
 {
 	rdpContext* context;
@@ -88,53 +137,84 @@ static BOOL android_process_event(ANDROID_EVENT_QUEUE* queue, freerdp* inst)
 	context = inst->context;
 	WINPR_ASSERT(context);
 
-	while (android_peek_event(queue))
+	for (;;)
 	{
+		BOOL rc = FALSE;
 		androidContext* afc = (androidContext*)context;
+
+		EnterCriticalSection(&queue->lock);
 		ANDROID_EVENT* event = android_pop_event(queue);
+		LeaveCriticalSection(&queue->lock);
 
-		if (event->type == EVENT_TYPE_KEY)
-		{
-			ANDROID_EVENT_KEY* key_event = (ANDROID_EVENT_KEY*)event;
-			freerdp_input_send_keyboard_event(context->input, key_event->flags,
-			                                  key_event->scancode);
-			android_event_free((ANDROID_EVENT*)key_event);
-		}
-		else if (event->type == EVENT_TYPE_KEY_UNICODE)
-		{
-			ANDROID_EVENT_KEY* key_event = (ANDROID_EVENT_KEY*)event;
-			freerdp_input_send_keyboard_event(context->input, key_event->flags,
-			                                  key_event->scancode);
-			android_event_free((ANDROID_EVENT*)key_event);
-		}
-		else if (event->type == EVENT_TYPE_CURSOR)
-		{
-			ANDROID_EVENT_CURSOR* cursor_event = (ANDROID_EVENT_CURSOR*)event;
-			context->input->MouseEvent(context->input, cursor_event->flags, cursor_event->x,
-			                           cursor_event->y);
-			android_event_free((ANDROID_EVENT*)cursor_event);
-		}
-		else if (event->type == EVENT_TYPE_CLIPBOARD)
-		{
-			UINT32 size;
-			UINT32 formatId;
-			ANDROID_EVENT_CLIPBOARD* clipboard_event = (ANDROID_EVENT_CLIPBOARD*)event;
-			formatId = ClipboardRegisterFormat(afc->clipboard, "UTF8_STRING");
-			size = clipboard_event->data_length;
+		if (!event)
+			break;
 
-			if (size)
-				ClipboardSetData(afc->clipboard, formatId, clipboard_event->data, size);
-			else
-				ClipboardEmpty(afc->clipboard);
-
-			android_cliprdr_send_client_format_list(afc->cliprdr);
-			android_event_free((ANDROID_EVENT*)clipboard_event);
-		}
-		else if (event->type == EVENT_TYPE_DISCONNECT)
+		switch (event->type)
 		{
-			android_event_free(event);
+			case EVENT_TYPE_KEY:
+			{
+				ANDROID_EVENT_KEY* key_event = (ANDROID_EVENT_KEY*)event;
+
+				rc = freerdp_input_send_keyboard_event(context->input, key_event->flags,
+				                                       key_event->scancode);
+			}
+			break;
+
+			case EVENT_TYPE_KEY_UNICODE:
+			{
+				ANDROID_EVENT_KEY* key_event = (ANDROID_EVENT_KEY*)event;
+
+				rc = freerdp_input_send_unicode_keyboard_event(context->input, key_event->flags,
+				                                               key_event->scancode);
+			}
+			break;
+
+			case EVENT_TYPE_KEY_AS_UNICODE:
+			{
+				ANDROID_EVENT_KEY_AS_UNICODE* key_event = (ANDROID_EVENT_KEY_AS_UNICODE*)event;
+
+				/* The Java side still sends key combinations as virtual keys, so for now no Ctrl,
+				 * Alt or Win is in the mask here. */
+				rc = freerdp_client_send_key_as_unicode(&afc->common, key_event->flags,
+				                                        key_event->str, key_event->scancode,
+				                                        key_event->modmask);
+			}
+			break;
+
+			case EVENT_TYPE_CURSOR:
+			{
+				ANDROID_EVENT_CURSOR* cursor_event = (ANDROID_EVENT_CURSOR*)event;
+
+				rc = freerdp_input_send_mouse_event(context->input, cursor_event->flags,
+				                                    cursor_event->x, cursor_event->y);
+			}
+			break;
+
+			case EVENT_TYPE_CLIPBOARD:
+			{
+				ANDROID_EVENT_CLIPBOARD* clipboard_event = (ANDROID_EVENT_CLIPBOARD*)event;
+				const char* mimeType = clipboard_event->mimeType;
+				UINT32 formatId = ClipboardRegisterFormat(afc->clipboard, mimeType);
+				UINT32 size = clipboard_event->data_length;
+
+				if (size)
+					ClipboardSetData(afc->clipboard, formatId, clipboard_event->data, size);
+				else
+					ClipboardEmpty(afc->clipboard);
+
+				rc = (android_cliprdr_send_client_format_list(afc->cliprdr) == CHANNEL_RC_OK);
+			}
+			break;
+
+			case EVENT_TYPE_DISCONNECT:
+			default:
+				break;
+		}
+
+		android_event_free(event);
+
+		if (!rc)
 			return FALSE;
-		}
 	}
 
 	return TRUE;
@@ -145,12 +225,12 @@ HANDLE android_get_handle(freerdp* inst)
 	androidContext* aCtx;
 
 	if (!inst || !inst->context)
-		return NULL;
+		return nullptr;
 
 	aCtx = (androidContext*)inst->context;
 
 	if (!aCtx->event_queue || !aCtx->event_queue->isSet)
-		return NULL;
+		return nullptr;
 
 	return aCtx->event_queue->isSet;
 }
@@ -181,11 +261,10 @@ BOOL android_check_handle(freerdp* inst)
 
 ANDROID_EVENT_KEY* android_event_key_new(int flags, UINT16 scancode)
 {
-	ANDROID_EVENT_KEY* event;
-	event = (ANDROID_EVENT_KEY*)calloc(1, sizeof(ANDROID_EVENT_KEY));
+	ANDROID_EVENT_KEY* event = (ANDROID_EVENT_KEY*)calloc(1, sizeof(ANDROID_EVENT_KEY));
 
 	if (!event)
-		return NULL;
+		return nullptr;
 
 	event->type = EVENT_TYPE_KEY;
 	event->flags = flags;
@@ -204,7 +283,7 @@ ANDROID_EVENT_KEY* android_event_unicodekey_new(UINT16 flags, UINT16 key)
 	event = (ANDROID_EVENT_KEY*)calloc(1, sizeof(ANDROID_EVENT_KEY));
 
 	if (!event)
-		return NULL;
+		return nullptr;
 
 	event->type = EVENT_TYPE_KEY_UNICODE;
 	event->flags = flags;
@@ -217,13 +296,41 @@ static void android_event_unicodekey_free(ANDROID_EVENT_KEY* event)
 	free(event);
 }
 
+ANDROID_EVENT_KEY_AS_UNICODE* android_event_key_as_unicode_new(UINT16 flags, UINT32 scancode,
+                                                               const WCHAR* wstr, size_t wlen,
+                                                               UINT32 modmask)
+{
+	ANDROID_EVENT_KEY_AS_UNICODE* event =
+	    (ANDROID_EVENT_KEY_AS_UNICODE*)calloc(1, sizeof(ANDROID_EVENT_KEY_AS_UNICODE));
+
+	if (!event)
+		return nullptr;
+
+	event->type = EVENT_TYPE_KEY_AS_UNICODE;
+	event->flags = flags;
+	event->scancode = scancode;
+	event->modmask = modmask;
+
+	/* One character, at most a surrogate pair, fits str. Anything else leaves it empty, which
+	 * tells freerdp_client_send_key_as_unicode to send the scancode. */
+	if (wstr && (wlen > 0) && (wlen <= 2) &&
+	    (ConvertWCharNToUtf8(wstr, wlen, event->str, ARRAYSIZE(event->str)) < 0))
+		memset(event->str, 0, sizeof(event->str));
+	return event;
+}
+
+static void android_event_key_as_unicode_free(ANDROID_EVENT_KEY_AS_UNICODE* event)
+{
+	free(event);
+}
+
 ANDROID_EVENT_CURSOR* android_event_cursor_new(UINT16 flags, UINT16 x, UINT16 y)
 {
 	ANDROID_EVENT_CURSOR* event;
 	event = (ANDROID_EVENT_CURSOR*)calloc(1, sizeof(ANDROID_EVENT_CURSOR));
 
 	if (!event)
-		return NULL;
+		return nullptr;
 
 	event->type = EVENT_TYPE_CURSOR;
 	event->x = x;
@@ -243,7 +350,7 @@ ANDROID_EVENT* android_event_disconnect_new(void)
 	event = (ANDROID_EVENT*)calloc(1, sizeof(ANDROID_EVENT));
 
 	if (!event)
-		return NULL;
+		return nullptr;
 
 	event->type = EVENT_TYPE_DISCONNECT;
 	return event;
@@ -254,28 +361,39 @@ static void android_event_disconnect_free(ANDROID_EVENT* event)
 	free(event);
 }
 
-ANDROID_EVENT_CLIPBOARD* android_event_clipboard_new(const void* data, size_t data_length)
+ANDROID_EVENT_CLIPBOARD* android_event_clipboard_new(const void* data, size_t data_length,
+                                                     const char* mimeType)
 {
 	ANDROID_EVENT_CLIPBOARD* event;
 	event = (ANDROID_EVENT_CLIPBOARD*)calloc(1, sizeof(ANDROID_EVENT_CLIPBOARD));
 
 	if (!event)
-		return NULL;
+		return nullptr;
 
 	event->type = EVENT_TYPE_CLIPBOARD;
+	event->mimeType = mimeType ? _strdup(mimeType) : nullptr;
 
-	if (data)
+	if (mimeType && !event->mimeType)
 	{
-		event->data = calloc(data_length + 1, sizeof(char));
+		free(event);
+		return nullptr;
+	}
+
+	if (data && data_length > 0)
+	{
+		const BOOL isText = !mimeType || strcmp(mimeType, "text/plain;charset=utf-8") == 0;
+		/* Text data needs a null terminator; image data is stored as-is. */
+		event->data = isText ? calloc(data_length + 1, sizeof(char)) : malloc(data_length);
 
 		if (!event->data)
 		{
+			free(event->mimeType);
 			free(event);
-			return NULL;
+			return nullptr;
 		}
 
 		memcpy(event->data, data, data_length);
-		event->data_length = data_length + 1;
+		event->data_length = isText ? data_length + 1 : data_length;
 	}
 
 	return event;
@@ -286,6 +404,7 @@ static void android_event_clipboard_free(ANDROID_EVENT_CLIPBOARD* event)
 	if (event)
 	{
 		free(event->data);
+		free(event->mimeType);
 		free(event);
 	}
 }
@@ -304,7 +423,7 @@ BOOL android_event_queue_init(freerdp* inst)
 
 	queue->size = 16;
 	queue->count = 0;
-	queue->isSet = CreateEventA(NULL, TRUE, FALSE, NULL);
+	queue->isSet = CreateEventA(nullptr, TRUE, FALSE, nullptr);
 
 	if (!queue->isSet)
 	{
@@ -317,7 +436,18 @@ BOOL android_event_queue_init(freerdp* inst)
 	if (!queue->events)
 	{
 		WLog_ERR(TAG, "android_event_queue_init: memory allocation failed");
-		CloseHandle(queue->isSet);
+		if (!CloseHandle(queue->isSet))
+			WLog_WARN(TAG, "CloseHandle failed");
+		free(queue);
+		return FALSE;
+	}
+
+	if (!InitializeCriticalSectionAndSpinCount(&queue->lock, 4000))
+	{
+		WLog_ERR(TAG, "android_event_queue_init: failed to initialize lock");
+		free((void*)queue->events);
+		if (!CloseHandle(queue->isSet))
+			WLog_WARN(TAG, "CloseHandle failed");
 		free(queue);
 		return FALSE;
 	}
@@ -339,20 +469,26 @@ void android_event_queue_uninit(freerdp* inst)
 
 	if (queue)
 	{
+		aCtx->event_queue = nullptr;
+
 		if (queue->isSet)
 		{
-			CloseHandle(queue->isSet);
-			queue->isSet = NULL;
+			if (!CloseHandle(queue->isSet))
+				WLog_WARN(TAG, "CloseHandle failed");
+			queue->isSet = nullptr;
 		}
 
 		if (queue->events)
 		{
-			free(queue->events);
-			queue->events = NULL;
+			for (size_t i = 0; i < queue->count; i++)
+				android_event_free(queue->events[i]);
+			free((void*)queue->events);
+			queue->events = nullptr;
 			queue->size = 0;
 			queue->count = 0;
 		}
 
+		DeleteCriticalSection(&queue->lock);
 		free(queue);
 	}
 }
@@ -370,6 +506,10 @@ void android_event_free(ANDROID_EVENT* event)
 
 		case EVENT_TYPE_KEY_UNICODE:
 			android_event_unicodekey_free((ANDROID_EVENT_KEY*)event);
+			break;
+
+		case EVENT_TYPE_KEY_AS_UNICODE:
+			android_event_key_as_unicode_free((ANDROID_EVENT_KEY_AS_UNICODE*)event);
 			break;
 
 		case EVENT_TYPE_CURSOR:

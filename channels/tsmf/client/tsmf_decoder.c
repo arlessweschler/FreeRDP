@@ -32,20 +32,23 @@
 
 static ITSMFDecoder* tsmf_load_decoder_by_name(const char* name)
 {
-	ITSMFDecoder* decoder;
-	TSMF_DECODER_ENTRY entry;
+	ITSMFDecoder* decoder = nullptr;
+	union
+	{
+		PVIRTUALCHANNELENTRY pvce;
+		TSMF_DECODER_ENTRY entry;
+	} cnv;
+	cnv.pvce = freerdp_load_channel_addin_entry("tsmf", name, "decoder", 0);
 
-	entry = (TSMF_DECODER_ENTRY)(void*)freerdp_load_channel_addin_entry("tsmf", name, "decoder", 0);
+	if (!cnv.entry)
+		return nullptr;
 
-	if (!entry)
-		return NULL;
+	const UINT rc = cnv.entry(&decoder);
 
-	decoder = entry();
-
-	if (!decoder)
+	if ((rc != CHANNEL_RC_OK) || !decoder)
 	{
 		WLog_ERR(TAG, "failed to call export function in %s", name);
-		return NULL;
+		return nullptr;
 	}
 
 	return decoder;
@@ -61,14 +64,12 @@ static BOOL tsmf_decoder_set_format(ITSMFDecoder* decoder, TS_AM_MEDIA_TYPE* med
 
 ITSMFDecoder* tsmf_load_decoder(const char* name, TS_AM_MEDIA_TYPE* media_type)
 {
-	ITSMFDecoder* decoder = NULL;
+	ITSMFDecoder* decoder = nullptr;
 
 	if (name)
-	{
 		decoder = tsmf_load_decoder_by_name(name);
-	}
 
-#if defined(WITH_GSTREAMER_1_0) || defined(WITH_GSTREAMER_0_10)
+#if defined(WITH_GSTREAMER_1_0)
 	if (!decoder)
 		decoder = tsmf_load_decoder_by_name("gstreamer");
 #endif
@@ -83,7 +84,7 @@ ITSMFDecoder* tsmf_load_decoder(const char* name, TS_AM_MEDIA_TYPE* media_type)
 		if (!tsmf_decoder_set_format(decoder, media_type))
 		{
 			decoder->Free(decoder);
-			decoder = NULL;
+			decoder = nullptr;
 		}
 	}
 
@@ -92,14 +93,14 @@ ITSMFDecoder* tsmf_load_decoder(const char* name, TS_AM_MEDIA_TYPE* media_type)
 
 BOOL tsmf_check_decoder_available(const char* name)
 {
-	ITSMFDecoder* decoder = NULL;
+	ITSMFDecoder* decoder = nullptr;
 	BOOL retValue = FALSE;
 
 	if (name)
 	{
 		decoder = tsmf_load_decoder_by_name(name);
 	}
-#if defined(WITH_GSTREAMER_1_0) || defined(WITH_GSTREAMER_0_10)
+#if defined(WITH_GSTREAMER_1_0)
 	if (!decoder)
 		decoder = tsmf_load_decoder_by_name("gstreamer");
 #endif
@@ -112,7 +113,7 @@ BOOL tsmf_check_decoder_available(const char* name)
 	if (decoder)
 	{
 		decoder->Free(decoder);
-		decoder = NULL;
+		decoder = nullptr;
 		retValue = TRUE;
 	}
 

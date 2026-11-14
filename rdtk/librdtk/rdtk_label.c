@@ -16,6 +16,8 @@
  * limitations under the License.
  */
 
+#include <winpr/assert.h>
+
 #include <rdtk/config.h>
 
 #include "rdtk_font.h"
@@ -23,20 +25,22 @@
 #include "rdtk_label.h"
 
 int rdtk_label_draw(rdtkSurface* surface, uint16_t nXDst, uint16_t nYDst, uint16_t nWidth,
-                    uint16_t nHeight, rdtkLabel* label, const char* text, uint16_t hAlign,
-                    uint16_t vAlign)
+                    uint16_t nHeight, WINPR_ATTR_UNUSED rdtkLabel* label, const char* text,
+                    WINPR_ATTR_UNUSED uint16_t hAlign, WINPR_ATTR_UNUSED uint16_t vAlign)
 {
-	uint16_t offsetX;
-	uint16_t offsetY;
-	uint16_t textWidth;
-	uint16_t textHeight;
-	rdtkFont* font;
-	rdtkEngine* engine;
+	uint16_t offsetX = 0;
+	uint16_t offsetY = 0;
+	uint16_t textWidth = 0;
+	uint16_t textHeight = 0;
 
-	engine = surface->engine;
-	font = engine->font;
+	WINPR_ASSERT(surface);
 
-	rdtk_font_text_draw_size(font, &textWidth, &textHeight, text);
+	rdtkEngine* engine = surface->engine;
+	rdtkFont* font = engine->font;
+
+	const int rc1 = rdtk_font_text_draw_size(font, &textWidth, &textHeight, text);
+	if (rc1 < 0)
+		return rc1;
 
 	if ((textWidth > 0) && (textHeight > 0))
 	{
@@ -49,7 +53,9 @@ int rdtk_label_draw(rdtkSurface* surface, uint16_t nXDst, uint16_t nYDst, uint16
 		if (textHeight < nHeight)
 			offsetY = ((nHeight - textHeight) / 2);
 
-		rdtk_font_draw_text(surface, nXDst + offsetX, nYDst + offsetY, font, text);
+		const int rc2 = rdtk_font_draw_text(surface, nXDst + offsetX, nYDst + offsetY, font, text);
+		if (rc2 < 0)
+			return rc2;
 	}
 
 	return 1;
@@ -57,12 +63,11 @@ int rdtk_label_draw(rdtkSurface* surface, uint16_t nXDst, uint16_t nYDst, uint16
 
 rdtkLabel* rdtk_label_new(rdtkEngine* engine)
 {
-	rdtkLabel* label;
-
-	label = (rdtkLabel*)calloc(1, sizeof(rdtkLabel));
+	WINPR_ASSERT(engine);
+	rdtkLabel* label = (rdtkLabel*)calloc(1, sizeof(rdtkLabel));
 
 	if (!label)
-		return NULL;
+		return nullptr;
 
 	label->engine = engine;
 
@@ -76,6 +81,7 @@ void rdtk_label_free(rdtkLabel* label)
 
 int rdtk_label_engine_init(rdtkEngine* engine)
 {
+	WINPR_ASSERT(engine);
 	if (!engine->label)
 	{
 		engine->label = rdtk_label_new(engine);
@@ -86,10 +92,11 @@ int rdtk_label_engine_init(rdtkEngine* engine)
 
 int rdtk_label_engine_uninit(rdtkEngine* engine)
 {
+	WINPR_ASSERT(engine);
 	if (engine->label)
 	{
 		rdtk_label_free(engine->label);
-		engine->label = NULL;
+		engine->label = nullptr;
 	}
 
 	return 1;

@@ -26,6 +26,7 @@
 #include <freerdp/constants.h>
 #include <freerdp/utils/signal.h>
 #include <freerdp/client/cmdline.h>
+#include <freerdp/client/aad_helper.h>
 
 #include "MRDPView.h"
 
@@ -48,12 +49,15 @@ static int mfreerdp_client_start(rdpContext *context)
 	MRDPView *view;
 	mfContext *mfc = (mfContext *)context;
 
-	if (mfc->view == NULL)
+	if (mfc->view == nullptr)
 	{
 		// view not specified beforehand. Create view dynamically
-		mfc->view =
-		    [[MRDPView alloc] initWithFrame:NSMakeRect(0, 0, context->settings->DesktopWidth,
-		                                               context->settings->DesktopHeight)];
+		mfc->view = [[MRDPView alloc]
+		    initWithFrame:NSMakeRect(
+		                      0, 0,
+		                      freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth),
+		                      freerdp_settings_get_uint32(context->settings,
+		                                                  FreeRDP_DesktopHeight))];
 		mfc->view_ownership = TRUE;
 	}
 
@@ -87,15 +91,17 @@ static BOOL mfreerdp_client_new(freerdp *instance, rdpContext *context)
 	mfc = (mfContext *)instance->context;
 	WINPR_ASSERT(mfc);
 
-	mfc->stopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	mfc->stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+	if (!mfc->stopEvent)
+		return FALSE;
 	context->instance->PreConnect = mac_pre_connect;
 	context->instance->PostConnect = mac_post_connect;
 	context->instance->PostDisconnect = mac_post_disconnect;
-	context->instance->Authenticate = mac_authenticate;
-	context->instance->GatewayAuthenticate = mac_gw_authenticate;
+	context->instance->AuthenticateEx = mac_authenticate_ex;
 	context->instance->VerifyCertificateEx = mac_verify_certificate_ex;
 	context->instance->VerifyChangedCertificateEx = mac_verify_changed_certificate_ex;
 	context->instance->LogonErrorInfo = mac_logon_error_info;
+	instance->GetAccessToken = client_failsafe_get_access_token;
 	return TRUE;
 }
 
@@ -107,7 +113,7 @@ static void mfreerdp_client_free(freerdp *instance, rdpContext *context)
 		return;
 
 	mfc = (mfContext *)instance->context;
-	CloseHandle(mfc->stopEvent);
+	(void)CloseHandle(mfc->stopEvent);
 }
 
 static void mf_scale_mouse_coordinates(mfContext *mfc, UINT16 *px, UINT16 *py)
@@ -116,10 +122,11 @@ static void mf_scale_mouse_coordinates(mfContext *mfc, UINT16 *px, UINT16 *py)
 	UINT16 y = *py;
 	UINT32 ww = mfc->client_width;
 	UINT32 wh = mfc->client_height;
-	UINT32 dw = mfc->common.context.settings->DesktopWidth;
-	UINT32 dh = mfc->common.context.settings->DesktopHeight;
+	UINT32 dw = freerdp_settings_get_uint32(mfc->common.context.settings, FreeRDP_DesktopWidth);
+	UINT32 dh = freerdp_settings_get_uint32(mfc->common.context.settings, FreeRDP_DesktopHeight);
 
-	if (!mfc->common.context.settings->SmartSizing || ((ww == dw) && (wh == dh)))
+	if (!freerdp_settings_get_bool(mfc->common.context.settings, FreeRDP_SmartSizing) ||
+	    ((ww == dw) && (wh == dh)))
 	{
 		y = y + mfc->yCurrentScroll;
 		x = x + mfc->xCurrentScroll;

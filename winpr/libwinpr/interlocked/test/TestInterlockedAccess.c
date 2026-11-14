@@ -5,18 +5,17 @@
 
 int TestInterlockedAccess(int argc, char* argv[])
 {
-	int index;
-	LONG* Addend;
-	LONG* Target;
-	LONG oldValue;
-	LONG* Destination;
-	LONGLONG oldValue64;
-	LONGLONG* Destination64;
+	LONG* Addend = nullptr;
+	LONG* Target = nullptr;
+	LONG oldValue = 0;
+	LONG* Destination = nullptr;
+	LONGLONG oldValue64 = 0;
+	LONGLONG* Destination64 = nullptr;
 	WINPR_UNUSED(argc);
 	WINPR_UNUSED(argv);
 	/* InterlockedIncrement */
 
-	Addend = winpr_aligned_malloc(sizeof(LONG), sizeof(LONG));
+	Addend = winpr_aligned_calloc(1, sizeof(LONG), sizeof(LONG));
 	if (!Addend)
 	{
 		printf("Failed to allocate memory\n");
@@ -25,7 +24,7 @@ int TestInterlockedAccess(int argc, char* argv[])
 
 	*Addend = 0;
 
-	for (index = 0; index < 10; index++)
+	for (int index = 0; index < 10; index++)
 		InterlockedIncrement(Addend);
 
 	if (*Addend != 10)
@@ -36,8 +35,8 @@ int TestInterlockedAccess(int argc, char* argv[])
 
 	/* InterlockedDecrement */
 
-	for (index = 0; index < 10; index++)
-		InterlockedDecrement(Addend);
+	for (int index = 0; index < 10; index++)
+		(void)InterlockedDecrement(Addend);
 
 	if (*Addend != 0)
 	{
@@ -47,7 +46,7 @@ int TestInterlockedAccess(int argc, char* argv[])
 
 	/* InterlockedExchange */
 
-	Target = winpr_aligned_malloc(sizeof(LONG), sizeof(LONG));
+	Target = winpr_aligned_calloc(1, sizeof(LONG), sizeof(LONG));
 
 	if (!Target)
 	{
@@ -91,7 +90,7 @@ int TestInterlockedAccess(int argc, char* argv[])
 
 	/* InterlockedCompareExchange (*Destination == Comparand) */
 
-	Destination = winpr_aligned_malloc(sizeof(LONG), sizeof(LONG));
+	Destination = winpr_aligned_calloc(1, sizeof(LONG), sizeof(LONG));
 	if (!Destination)
 	{
 		printf("Failed to allocate memory\n");
@@ -122,7 +121,7 @@ int TestInterlockedAccess(int argc, char* argv[])
 
 	*Destination = (LONG)0xAABBCCDDL;
 
-	oldValue = InterlockedCompareExchange(Destination, 0xCCDDEEFFL, 0x66778899);
+	oldValue = InterlockedCompareExchange(Destination, -857870593L, 0x66778899L);
 
 	if (oldValue != (LONG)0xAABBCCDDL)
 	{
@@ -142,7 +141,7 @@ int TestInterlockedAccess(int argc, char* argv[])
 
 	/* InterlockedCompareExchange64 (*Destination == Comparand) */
 
-	Destination64 = winpr_aligned_malloc(sizeof(LONGLONG), sizeof(LONGLONG));
+	Destination64 = winpr_aligned_calloc(1, sizeof(LONGLONG), sizeof(LONGLONG));
 	if (!Destination64)
 	{
 		printf("Failed to allocate memory\n");
@@ -152,7 +151,7 @@ int TestInterlockedAccess(int argc, char* argv[])
 	*Destination64 = 0x66778899AABBCCDD;
 
 	oldValue64 =
-	    InterlockedCompareExchange64(Destination64, 0x8899AABBCCDDEEFF, 0x66778899AABBCCDD);
+	    InterlockedCompareExchange64(Destination64, 0x0899AABBCCDDEEFFLL, 0x66778899AABBCCDD);
 
 	if (oldValue64 != 0x66778899AABBCCDD)
 	{
@@ -162,10 +161,10 @@ int TestInterlockedAccess(int argc, char* argv[])
 		return -1;
 	}
 
-	if ((*Destination64) != (LONGLONG)0x8899AABBCCDDEEFFLL)
+	if ((*Destination64) != 0x0899AABBCCDDEEFFLL)
 	{
 		printf("InterlockedCompareExchange failure: Actual: 0x%016" PRIX64
-		       ", Expected: 0x8899AABBCCDDEEFF\n",
+		       ", Expected: 0x0899AABBCCDDEEFFLL\n",
 		       *Destination64);
 		return -1;
 	}
@@ -174,7 +173,7 @@ int TestInterlockedAccess(int argc, char* argv[])
 
 	*Destination64 = 0x66778899AABBCCDDLL;
 
-	oldValue64 = InterlockedCompareExchange64(Destination64, 0x8899AABBCCDDEEFFLL, 12345);
+	oldValue64 = InterlockedCompareExchange64(Destination64, 0x0899AABBCCDDEEFFLL, 12345);
 
 	if (oldValue64 != 0x66778899AABBCCDDLL)
 	{

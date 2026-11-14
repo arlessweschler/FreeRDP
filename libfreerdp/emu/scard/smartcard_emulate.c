@@ -19,6 +19,7 @@
  */
 
 #include <freerdp/config.h>
+#include <freerdp/freerdp.h>
 
 #include <winpr/crt.h>
 #include <winpr/wlog.h>
@@ -28,6 +29,7 @@
 #include <winpr/smartcard.h>
 #include <winpr/collections.h>
 #include <winpr/crypto.h>
+#include <winpr/interlocked.h>
 
 #include <freerdp/emulate/scard/smartcard_emulate.h>
 #include "FreeRDP.ico.h"
@@ -37,10 +39,61 @@
 #define MAX_CACHE_ITEM_SIZE 4096
 #define MAX_CACHE_ITEM_VALUES 4096
 
+#define VGIDS_DEFAULT_RETRY_COUNTER 3
+
+typedef struct
+{
+	SCARDCONTEXT context;
+	wHashTable* table;
+} HandleCleanLoopArg;
+
 static CHAR g_ReaderNameA[] = { 'F', 'r', 'e', 'e', 'R', 'D', 'P', ' ',  'E',
 	                            'm', 'u', 'l', 'a', 't', 'o', 'r', '\0', '\0' };
-static WCHAR g_ReaderNameW[] = { 'F', 'r', 'e', 'e', 'R', 'D', 'P', ' ',  'E',
-	                             'm', 'u', 'l', 'a', 't', 'o', 'r', '\0', '\0' };
+static INIT_ONCE g_ReaderNameWGuard = INIT_ONCE_STATIC_INIT;
+static WCHAR g_ReaderNameW[32] = WINPR_C_ARRAY_INIT;
+static size_t g_ReaderNameWLen = 0;
+
+WINPR_ATTR_MALLOC(free, 1)
+static char* card_id_and_name_a(const UUID* CardIdentifier, LPCSTR LookupName)
+{
+	if (!CardIdentifier || !LookupName)
+		return nullptr;
+
+	size_t len = strlen(LookupName) + 34;
+	char* id = malloc(len);
+	if (!id)
+		return nullptr;
+
+	(void)snprintf(id, len, "%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X\\%s",
+	               CardIdentifier->Data1, CardIdentifier->Data2, CardIdentifier->Data3,
+	               CardIdentifier->Data4[0], CardIdentifier->Data4[1], CardIdentifier->Data4[2],
+	               CardIdentifier->Data4[3], CardIdentifier->Data4[4], CardIdentifier->Data4[5],
+	               CardIdentifier->Data4[6], CardIdentifier->Data4[7], LookupName);
+	return id;
+}
+
+WINPR_ATTR_MALLOC(free, 1)
+static char* card_id_and_name_w(const UUID* CardIdentifier, LPCWSTR LookupName)
+{
+	char* res = nullptr;
+	char* tmp = ConvertWCharToUtf8Alloc(LookupName, nullptr);
+	if (!tmp)
+		return nullptr;
+	res = card_id_and_name_a(CardIdentifier, tmp);
+	free(tmp);
+	return res;
+}
+
+WINPR_ATTR_NODISCARD
+static BOOL CALLBACK g_ReaderNameWInit(PINIT_ONCE InitOnce, PVOID Parameter, PVOID* Context)
+{
+	WINPR_UNUSED(InitOnce);
+	WINPR_UNUSED(Parameter);
+	WINPR_UNUSED(Context);
+	InitializeConstWCharFromUtf8(g_ReaderNameA, g_ReaderNameW, ARRAYSIZE(g_ReaderNameW));
+	g_ReaderNameWLen = _wcsnlen(g_ReaderNameW, ARRAYSIZE(g_ReaderNameW) - 2) + 2;
+	return TRUE;
+}
 
 struct smartcard_emulation_context
 {
@@ -53,7 +106,15 @@ struct smartcard_emulation_context
 	const char* pem;
 	const char* key;
 	const char* pin;
+	wHashTable* pinCounters;
 };
+
+typedef struct
+{
+	char* pin;
+	UINT16 curRetryCounter;
+	UINT16 retryCounter;
+} SmartcardPinCounterEntry;
 
 #define MAX_EMULATED_READERS 1
 typedef struct
@@ -63,9 +124,9 @@ typedef struct
 	SCARD_READERSTATEW readerStateW[MAX_EMULATED_READERS];
 	wHashTable* cards;
 	wArrayList* strings;
-	wHashTable* cacheA;
-	wHashTable* cacheW;
+	wHashTable* cache;
 	BOOL canceled;
+	volatile LONG semaphore;
 } SCardContext;
 
 typedef struct
@@ -94,12 +155,14 @@ typedef struct
 	char data[MAX_CACHE_ITEM_SIZE];
 } SCardCacheItem;
 
+WINPR_ATTR_NODISCARD
 static SCardHandle* find_reader(SmartcardEmulationContext* smartcard, const void* szReader,
                                 BOOL unicode);
 
 static const BYTE ATR[] = { 0x3b, 0xf7, 0x18, 0x00, 0x00, 0x80, 0x31, 0xfe, 0x45,
 	                        0x73, 0x66, 0x74, 0x65, 0x2d, 0x6e, 0x66, 0xc4 };
 
+WINPR_ATTR_NODISCARD
 static BOOL scard_status_transition(SCardContext* context)
 {
 	WINPR_ASSERT(context);
@@ -116,6 +179,8 @@ static BOOL scard_status_transition(SCardContext* context)
 			memcpy(reader->rgbAtr, ATR, sizeof(ATR));
 		}
 			{
+				if (!InitOnceExecuteOnce(&g_ReaderNameWGuard, g_ReaderNameWInit, nullptr, nullptr))
+					return FALSE;
 				SCARD_READERSTATEW* reader = &context->readerStateW[0];
 				reader->szReader = g_ReaderNameW;
 				reader->dwEventState = SCARD_STATE_PRESENT;
@@ -129,26 +194,42 @@ static BOOL scard_status_transition(SCardContext* context)
 	return TRUE;
 }
 
-static UINT32 scard_copy_strings(SCardContext* ctx, void* dst, UINT32 dstSize, const void* src,
-                                 UINT32 srcSize)
+WINPR_ATTR_NODISCARD
+static UINT32 scard_copy_strings(SCardContext* ctx, void* dst, size_t dstSize, const void* src,
+                                 size_t srcSize)
 {
 	WINPR_ASSERT(ctx);
 	WINPR_ASSERT(dst);
 
+	WINPR_ASSERT(srcSize <= UINT32_MAX);
+	WINPR_ASSERT(dstSize <= UINT32_MAX);
+
 	if (dstSize == SCARD_AUTOALLOCATE)
 	{
+		if (srcSize == 0)
+			return 0;
+
 		void* tmp = malloc(srcSize);
+		if (!tmp)
+			return 0;
 		memcpy(tmp, src, srcSize);
 		ArrayList_Append(ctx->strings, tmp);
 		*((void**)dst) = tmp;
-		return srcSize;
+		return (UINT32)srcSize;
 	}
 	else
 	{
-		UINT32 min = MIN(dstSize, srcSize);
+		const size_t min = MIN(dstSize, srcSize);
 		memcpy(dst, src, min);
-		return min;
+		return (UINT32)min;
 	}
+}
+
+static void waitForCancel(SCardContext* ctx)
+{
+	WINPR_ASSERT(ctx);
+	while (InterlockedCompareExchange(&ctx->semaphore, 0, 0) > 0)
+		Sleep(10);
 }
 
 static void scard_context_free(void* context)
@@ -156,43 +237,28 @@ static void scard_context_free(void* context)
 	SCardContext* ctx = context;
 	if (ctx)
 	{
+		/* HACK: There might be long running calls in background still active.
+		 * Emulation does ~100ms polling loops to check if we're still ok, so do a 2 * 100ms delay
+		 * to ensure such calls are terminated.
+		 *
+		 * See Emulate_SCardGetStatusChangeA and Emulate_SCardGetStatusChangeW
+		 */
+		ctx->canceled = TRUE;
+		waitForCancel(ctx);
+
 		HashTable_Free(ctx->cards);
 		ArrayList_Free(ctx->strings);
-		HashTable_Free(ctx->cacheA);
-		HashTable_Free(ctx->cacheW);
+		HashTable_Free(ctx->cache);
 	}
 	free(ctx);
 }
 
-static BOOL char_compare(const void* a, const void* b)
-{
-	const CHAR* wa = a;
-	const CHAR* wb = b;
-
-	if (!a && !b)
-		return TRUE;
-	if (!a || !b)
-		return FALSE;
-	return strcmp(wa, wb) == 0;
-}
-
-static BOOL wchar_compare(const void* a, const void* b)
-{
-	const WCHAR* wa = a;
-	const WCHAR* wb = b;
-
-	if (!a && !b)
-		return TRUE;
-	if (!a || !b)
-		return FALSE;
-	return _wcscmp(wa, wb) == 0;
-}
-
+WINPR_ATTR_MALLOC(scard_context_free, 1)
 static SCardContext* scard_context_new(void)
 {
 	SCardContext* ctx = calloc(1, sizeof(SCardContext));
 	if (!ctx)
-		return NULL;
+		return nullptr;
 
 	ctx->strings = ArrayList_New(FALSE);
 	if (!ctx->strings)
@@ -204,45 +270,24 @@ static SCardContext* scard_context_new(void)
 		obj->fnObjectFree = free;
 	}
 
-	ctx->cacheA = HashTable_New(FALSE);
-	if (!ctx->cacheA)
+	ctx->cache = HashTable_New(FALSE);
+	if (!ctx->cache)
+		goto fail;
+	if (!HashTable_SetupForStringData(ctx->cache, FALSE))
 		goto fail;
 	else
 	{
-		wObject* key = HashTable_KeyObject(ctx->cacheA);
-		wObject* val = HashTable_ValueObject(ctx->cacheA);
-		WINPR_ASSERT(key);
+		wObject* val = HashTable_ValueObject(ctx->cache);
 		WINPR_ASSERT(val);
-
-		key->fnObjectEquals = char_compare;
-		key->fnObjectNew = (OBJECT_NEW_FN)_strdup;
-		key->fnObjectFree = free;
-
 		val->fnObjectFree = free;
 	}
 
-	ctx->cacheW = HashTable_New(FALSE);
-	if (!ctx->cacheW)
+	if (!scard_status_transition(ctx))
 		goto fail;
-	else
-	{
-		wObject* key = HashTable_KeyObject(ctx->cacheW);
-		wObject* val = HashTable_ValueObject(ctx->cacheW);
-		WINPR_ASSERT(key);
-		WINPR_ASSERT(val);
-
-		key->fnObjectEquals = wchar_compare;
-		key->fnObjectNew = (OBJECT_NEW_FN)_wcsdup;
-		key->fnObjectFree = free;
-
-		val->fnObjectFree = free;
-	}
-
-	scard_status_transition(ctx);
 	return ctx;
 fail:
 	scard_context_free(ctx);
-	return NULL;
+	return nullptr;
 }
 
 static void scard_handle_free(void* handle)
@@ -256,10 +301,11 @@ static void scard_handle_free(void* handle)
 	free(hdl);
 }
 
+WINPR_ATTR_MALLOC(scard_handle_free, 1)
 static SCardHandle* scard_handle_new(SmartcardEmulationContext* smartcard, SCARDCONTEXT context,
                                      const void* name, BOOL unicode)
 {
-	SCardHandle* hdl;
+	SCardHandle* hdl = nullptr;
 
 	WINPR_ASSERT(smartcard);
 
@@ -268,7 +314,7 @@ static SCardHandle* scard_handle_new(SmartcardEmulationContext* smartcard, SCARD
 		goto fail;
 
 	/* ATTENTION: Do not use _strdup or _wcsdup!
-	 * These strings are required to be double NULL terminated!
+	 * These strings are required to be double nullptr terminated!
 	 */
 	if (unicode)
 	{
@@ -283,8 +329,8 @@ static SCardHandle* scard_handle_new(SmartcardEmulationContext* smartcard, SCARD
 	{
 		size_t s = strlen(name);
 
-		hdl->szReader.pw = calloc(s + 2, sizeof(CHAR));
-		if (!hdl->szReader.pw)
+		hdl->szReader.pc = calloc(s + 2, sizeof(CHAR));
+		if (!hdl->szReader.pc)
 			goto fail;
 		memcpy(hdl->szReader.pv, name, s * sizeof(CHAR));
 	}
@@ -292,7 +338,7 @@ static SCardHandle* scard_handle_new(SmartcardEmulationContext* smartcard, SCARD
 	if (!hdl->szReader.pv)
 		goto fail;
 
-	hdl->vgids = vgids_new();
+	hdl->vgids = vgids_new(smartcard);
 	if (!hdl->vgids)
 		goto fail;
 
@@ -314,27 +360,26 @@ static SCardHandle* scard_handle_new(SmartcardEmulationContext* smartcard, SCARD
 
 fail:
 	scard_handle_free(hdl);
-	return NULL;
+	return nullptr;
 }
 
+WINPR_ATTR_NODISCARD
 static LONG scard_handle_valid(SmartcardEmulationContext* smartcard, SCARDHANDLE handle)
 {
-	SCardHandle* ctx;
-
 	WINPR_ASSERT(smartcard);
 
-	ctx = HashTable_GetItemValue(smartcard->handles, (const void*)handle);
+	SCardHandle* ctx = HashTable_GetItemValue(smartcard->handles, (const void*)handle);
 	if (!ctx)
 		return SCARD_E_INVALID_HANDLE;
 
 	return SCARD_S_SUCCESS;
 }
 
+WINPR_ATTR_NODISCARD
 static LONG scard_reader_name_valid_a(SmartcardEmulationContext* smartcard, SCARDCONTEXT context,
                                       const char* name)
 {
-	size_t x;
-	SCardContext* ctx;
+	SCardContext* ctx = nullptr;
 
 	WINPR_ASSERT(smartcard);
 	ctx = HashTable_GetItemValue(smartcard->contexts, (const void*)context);
@@ -342,7 +387,7 @@ static LONG scard_reader_name_valid_a(SmartcardEmulationContext* smartcard, SCAR
 	WINPR_ASSERT(name);
 	WINPR_ASSERT(ctx);
 
-	for (x = 0; x < MAX_EMULATED_READERS; x++)
+	for (size_t x = 0; x < MAX_EMULATED_READERS; x++)
 	{
 		const SCARD_READERSTATEA* reader = &ctx->readerStateA[x];
 		if (strcmp(reader->szReader, name) == 0)
@@ -352,11 +397,11 @@ static LONG scard_reader_name_valid_a(SmartcardEmulationContext* smartcard, SCAR
 	return SCARD_E_UNKNOWN_READER;
 }
 
+WINPR_ATTR_NODISCARD
 static LONG scard_reader_name_valid_w(SmartcardEmulationContext* smartcard, SCARDCONTEXT context,
                                       const WCHAR* name)
 {
-	size_t x;
-	SCardContext* ctx;
+	SCardContext* ctx = nullptr;
 
 	WINPR_ASSERT(smartcard);
 	ctx = HashTable_GetItemValue(smartcard->contexts, (const void*)context);
@@ -364,7 +409,7 @@ static LONG scard_reader_name_valid_w(SmartcardEmulationContext* smartcard, SCAR
 	WINPR_ASSERT(name);
 	WINPR_ASSERT(ctx);
 
-	for (x = 0; x < MAX_EMULATED_READERS; x++)
+	for (size_t x = 0; x < MAX_EMULATED_READERS; x++)
 	{
 		const SCARD_READERSTATEW* reader = &ctx->readerStateW[x];
 		if (_wcscmp(reader->szReader, name) == 0)
@@ -383,7 +428,7 @@ LONG WINAPI Emulate_SCardEstablishContext(SmartcardEmulationContext* smartcard, 
                                           LPSCARDCONTEXT phContext)
 {
 	LONG status = SCARD_E_NO_MEMORY;
-	SCardContext* ctx;
+	SCardContext* ctx = nullptr;
 
 	WINPR_ASSERT(smartcard);
 
@@ -398,52 +443,72 @@ LONG WINAPI Emulate_SCardEstablishContext(SmartcardEmulationContext* smartcard, 
 
 	if (ctx)
 	{
-		SCARDCONTEXT context = { 0 };
+		SCARDCONTEXT context = WINPR_C_ARRAY_INIT;
 
-		winpr_RAND((BYTE*)&context, sizeof(SCARDCONTEXT));
-		if (HashTable_Insert(smartcard->contexts, (const void*)context, ctx))
+		if (winpr_RAND(&context, sizeof(SCARDCONTEXT)) >= 0)
 		{
-			*phContext = context;
-			status = SCARD_S_SUCCESS;
+			if (HashTable_Insert(smartcard->contexts, (const void*)context, ctx))
+			{
+				*phContext = context;
+				status = SCARD_S_SUCCESS;
+			}
 		}
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardEstablishContext } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	if (status != SCARD_S_SUCCESS)
 		scard_context_free(ctx);
+	// NOLINTNEXTLINE(clang-analyzer-unix.Malloc): HashTable_Insert takes ownership of ctx
 	return status;
+}
+
+WINPR_ATTR_NODISCARD
+static BOOL remove_handles(const void* key, void* value, void* arg)
+{
+	WINPR_ASSERT(arg);
+	WINPR_ASSERT(value);
+
+	const HandleCleanLoopArg* harg = arg;
+	SCardHandle* handle = value;
+	if (handle->hContext == harg->context)
+	{
+		if (!HashTable_Remove(harg->table, key))
+			return FALSE;
+	}
+	return TRUE;
 }
 
 LONG WINAPI Emulate_SCardReleaseContext(SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext)
 {
-	LONG status;
-	SCardContext* value;
+	LONG status = SCARD_S_SUCCESS;
 
 	WINPR_ASSERT(smartcard);
 
-	value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
+	SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
 
 	WLog_Print(smartcard->log, smartcard->log_default_level, "SCardReleaseContext { hContext: %p",
 	           (void*)hContext);
 
+	HandleCleanLoopArg arg = { .context = hContext, .table = smartcard->handles };
+	if (!HashTable_Foreach(smartcard->handles, remove_handles, &arg))
+		status = SCARD_E_INVALID_HANDLE;
+
 	if (value)
 		HashTable_Remove(smartcard->contexts, (const void*)hContext);
 
-	status = SCARD_S_SUCCESS;
-
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardReleaseContext } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
 LONG WINAPI Emulate_SCardIsValidContext(SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext)
 {
-	LONG status;
+	LONG status = 0;
 
 	WINPR_ASSERT(smartcard);
 
@@ -457,18 +522,20 @@ LONG WINAPI Emulate_SCardIsValidContext(SmartcardEmulationContext* smartcard, SC
 	{
 		SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
 		WINPR_ASSERT(value); /* Must be valid after Emulate_SCardIsValidContext */
+		if (!value)
+			return SCARD_F_INTERNAL_ERROR;
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardIsValidContext } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardListReaderGroupsA(SmartcardEmulationContext* smartcard,
-                                           SCARDCONTEXT hContext, LPSTR mszGroups,
-                                           LPDWORD pcchGroups)
+LONG WINAPI Emulate_SCardListReaderGroupsA(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext,
+    LPSTR mszGroups /* NOLINT(readability-non-const-parameter) */, LPDWORD pcchGroups)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -479,18 +546,19 @@ LONG WINAPI Emulate_SCardListReaderGroupsA(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(pcchGroups);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListReaderGroupsA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardListReaderGroupsW(SmartcardEmulationContext* smartcard,
-                                           SCARDCONTEXT hContext, LPWSTR mszGroups,
-                                           LPDWORD pcchGroups)
+LONG WINAPI Emulate_SCardListReaderGroupsW(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext,
+    LPWSTR mszGroups /* NOLINT(readability-non-const-parameter) */, LPDWORD pcchGroups)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -501,11 +569,12 @@ LONG WINAPI Emulate_SCardListReaderGroupsW(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(pcchGroups);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListReaderGroupsW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -544,7 +613,7 @@ LONG WINAPI Emulate_SCardListReadersA(SmartcardEmulationContext* smartcard, SCAR
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListReadersA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -562,6 +631,8 @@ LONG WINAPI Emulate_SCardListReadersW(SmartcardEmulationContext* smartcard, SCAR
 
 	WINPR_UNUSED(mszGroups); /* Not required */
 
+	if (!InitOnceExecuteOnce(&g_ReaderNameWGuard, g_ReaderNameWInit, nullptr, nullptr))
+		return FALSE;
 	if (SCARD_S_SUCCESS == status)
 	{
 		SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
@@ -573,25 +644,30 @@ LONG WINAPI Emulate_SCardListReadersW(SmartcardEmulationContext* smartcard, SCAR
 
 		/* Return length only */
 		if (!mszReaders)
-			*pcchReaders = ARRAYSIZE(g_ReaderNameW);
+		{
+			WINPR_ASSERT(g_ReaderNameWLen <= UINT32_MAX);
+			*pcchReaders = (UINT32)g_ReaderNameWLen;
+		}
 		else
 		{
 			*pcchReaders = scard_copy_strings(value, mszReaders, *pcchReaders, g_ReaderNameW,
-			                                  sizeof(g_ReaderNameW)) /
+			                                  g_ReaderNameWLen * sizeof(WCHAR)) /
 			               sizeof(WCHAR);
 		}
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListReadersW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
 LONG WINAPI Emulate_SCardListCardsA(SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext,
                                     LPCBYTE pbAtr, LPCGUID rgquidInterfaces,
-                                    DWORD cguidInterfaceCount, CHAR* mszCards, LPDWORD pcchCards)
+                                    DWORD cguidInterfaceCount,
+                                    CHAR* mszCards /* NOLINT(readability-non-const-parameter) */,
+                                    LPDWORD pcchCards /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -605,18 +681,21 @@ LONG WINAPI Emulate_SCardListCardsA(SmartcardEmulationContext* smartcard, SCARDC
 	WINPR_UNUSED(pcchCards);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListCardsA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
 LONG WINAPI Emulate_SCardListCardsW(SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext,
                                     LPCBYTE pbAtr, LPCGUID rgquidInterfaces,
-                                    DWORD cguidInterfaceCount, WCHAR* mszCards, LPDWORD pcchCards)
+                                    DWORD cguidInterfaceCount,
+                                    WCHAR* mszCards /* NOLINT(readability-non-const-parameter) */,
+                                    LPDWORD pcchCards /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -630,18 +709,19 @@ LONG WINAPI Emulate_SCardListCardsW(SmartcardEmulationContext* smartcard, SCARDC
 	WINPR_UNUSED(pcchCards);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListCardsW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardListInterfacesA(SmartcardEmulationContext* smartcard,
-                                         SCARDCONTEXT hContext, LPCSTR szCard,
-                                         LPGUID pguidInterfaces, LPDWORD pcguidInterfaces)
+LONG WINAPI Emulate_SCardListInterfacesA(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext, LPCSTR szCard,
+    LPGUID pguidInterfaces, LPDWORD pcguidInterfaces /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -653,18 +733,19 @@ LONG WINAPI Emulate_SCardListInterfacesA(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(pcguidInterfaces);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListInterfacesA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardListInterfacesW(SmartcardEmulationContext* smartcard,
-                                         SCARDCONTEXT hContext, LPCWSTR szCard,
-                                         LPGUID pguidInterfaces, LPDWORD pcguidInterfaces)
+LONG WINAPI Emulate_SCardListInterfacesW(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext, LPCWSTR szCard,
+    LPGUID pguidInterfaces, LPDWORD pcguidInterfaces /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -676,11 +757,12 @@ LONG WINAPI Emulate_SCardListInterfacesW(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(pcguidInterfaces);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListInterfacesW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -697,11 +779,12 @@ LONG WINAPI Emulate_SCardGetProviderIdA(SmartcardEmulationContext* smartcard, SC
 	WINPR_UNUSED(pguidProviderId);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetProviderIdA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -718,19 +801,20 @@ LONG WINAPI Emulate_SCardGetProviderIdW(SmartcardEmulationContext* smartcard, SC
 	WINPR_UNUSED(pguidProviderId);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetProviderIdW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardGetCardTypeProviderNameA(SmartcardEmulationContext* smartcard,
-                                                  SCARDCONTEXT hContext, LPCSTR szCardName,
-                                                  DWORD dwProviderId, CHAR* szProvider,
-                                                  LPDWORD pcchProvider)
+LONG WINAPI Emulate_SCardGetCardTypeProviderNameA(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext, LPCSTR szCardName,
+    DWORD dwProviderId, CHAR* szProvider /* NOLINT(readability-non-const-parameter) */,
+    LPDWORD pcchProvider /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -743,19 +827,20 @@ LONG WINAPI Emulate_SCardGetCardTypeProviderNameA(SmartcardEmulationContext* sma
 	WINPR_UNUSED(pcchProvider);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetCardTypeProviderNameA } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardGetCardTypeProviderNameW(SmartcardEmulationContext* smartcard,
-                                                  SCARDCONTEXT hContext, LPCWSTR szCardName,
-                                                  DWORD dwProviderId, WCHAR* szProvider,
-                                                  LPDWORD pcchProvider)
+LONG WINAPI Emulate_SCardGetCardTypeProviderNameW(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext, LPCWSTR szCardName,
+    DWORD dwProviderId, WCHAR* szProvider /* NOLINT(readability-non-const-parameter) */,
+    LPDWORD pcchProvider /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -768,11 +853,12 @@ LONG WINAPI Emulate_SCardGetCardTypeProviderNameW(SmartcardEmulationContext* sma
 	WINPR_UNUSED(pcchProvider);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetCardTypeProviderNameW } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -788,11 +874,12 @@ LONG WINAPI Emulate_SCardIntroduceReaderGroupA(SmartcardEmulationContext* smartc
 	WINPR_UNUSED(szGroupName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardIntroduceReaderGroupA } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -808,11 +895,12 @@ LONG WINAPI Emulate_SCardIntroduceReaderGroupW(SmartcardEmulationContext* smartc
 	WINPR_UNUSED(szGroupName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardIntroduceReaderGroupW } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -828,11 +916,12 @@ LONG WINAPI Emulate_SCardForgetReaderGroupA(SmartcardEmulationContext* smartcard
 	WINPR_UNUSED(szGroupName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardForgetReaderGroupA } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -848,11 +937,12 @@ LONG WINAPI Emulate_SCardForgetReaderGroupW(SmartcardEmulationContext* smartcard
 	WINPR_UNUSED(szGroupName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardForgetReaderGroupW } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -872,11 +962,12 @@ LONG WINAPI Emulate_SCardIntroduceReaderA(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(szDeviceName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardIntroduceReaderA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -896,11 +987,12 @@ LONG WINAPI Emulate_SCardIntroduceReaderW(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(szDeviceName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardIntroduceReaderW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -917,11 +1009,12 @@ LONG WINAPI Emulate_SCardForgetReaderA(SmartcardEmulationContext* smartcard, SCA
 	           (void*)hContext);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardForgetReaderA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -938,11 +1031,12 @@ LONG WINAPI Emulate_SCardForgetReaderW(SmartcardEmulationContext* smartcard, SCA
 	           (void*)hContext);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardForgetReaderW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -962,11 +1056,12 @@ LONG WINAPI Emulate_SCardAddReaderToGroupA(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(szGroupName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardAddReaderToGroupA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -986,11 +1081,12 @@ LONG WINAPI Emulate_SCardAddReaderToGroupW(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(szGroupName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardAddReaderToGroupW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1010,11 +1106,12 @@ LONG WINAPI Emulate_SCardRemoveReaderFromGroupA(SmartcardEmulationContext* smart
 	WINPR_UNUSED(szGroupName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardRemoveReaderFromGroupA } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1034,11 +1131,12 @@ LONG WINAPI Emulate_SCardRemoveReaderFromGroupW(SmartcardEmulationContext* smart
 	WINPR_UNUSED(szGroupName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardRemoveReaderFromGroupW } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1063,11 +1161,12 @@ LONG WINAPI Emulate_SCardIntroduceCardTypeA(SmartcardEmulationContext* smartcard
 	WINPR_UNUSED(cbAtrLen);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardIntroduceCardTypeA } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1092,11 +1191,12 @@ LONG WINAPI Emulate_SCardIntroduceCardTypeW(SmartcardEmulationContext* smartcard
 	WINPR_UNUSED(cbAtrLen);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardIntroduceCardTypeW } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1115,11 +1215,12 @@ LONG WINAPI Emulate_SCardSetCardTypeProviderNameA(SmartcardEmulationContext* sma
 	WINPR_UNUSED(szProvider);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardSetCardTypeProviderNameA } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1138,11 +1239,12 @@ LONG WINAPI Emulate_SCardSetCardTypeProviderNameW(SmartcardEmulationContext* sma
 	WINPR_UNUSED(szProvider);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardSetCardTypeProviderNameW } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1158,11 +1260,12 @@ LONG WINAPI Emulate_SCardForgetCardTypeA(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(szCardName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardForgetCardTypeA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1178,11 +1281,12 @@ LONG WINAPI Emulate_SCardForgetCardTypeW(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(szCardName);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardForgetCardTypeW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1205,21 +1309,24 @@ LONG WINAPI Emulate_SCardFreeMemory(SmartcardEmulationContext* smartcard, SCARDC
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardFreeMemory } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
 HANDLE WINAPI Emulate_SCardAccessStartedEvent(SmartcardEmulationContext* smartcard)
 {
-	HANDLE hEvent;
+	HANDLE hEvent = nullptr;
 
 	WINPR_ASSERT(smartcard);
 
 	WLog_Print(smartcard->log, smartcard->log_default_level, "SCardAccessStartedEvent {");
 
 	/* Not required, return random */
-	winpr_RAND((BYTE*)&hEvent, sizeof(hEvent));
+	if (winpr_RAND((void*)&hEvent, sizeof(hEvent)) < 0)
+	{
+		(void)fprintf(stderr, "winpr_RAND failed.\n");
+	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level, "SCardAccessStartedEvent } hEvent: %p",
 	           hEvent);
@@ -1252,11 +1359,12 @@ LONG WINAPI Emulate_SCardLocateCardsA(SmartcardEmulationContext* smartcard, SCAR
 	WINPR_UNUSED(cReaders);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardLocateCardsA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1275,11 +1383,12 @@ LONG WINAPI Emulate_SCardLocateCardsW(SmartcardEmulationContext* smartcard, SCAR
 	WINPR_UNUSED(cReaders);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardLocateCardsW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1300,11 +1409,12 @@ LONG WINAPI Emulate_SCardLocateCardsByATRA(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(cReaders);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardLocateCardsByATRA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1325,11 +1435,12 @@ LONG WINAPI Emulate_SCardLocateCardsByATRW(SmartcardEmulationContext* smartcard,
 	WINPR_UNUSED(cReaders);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardLocateCardsByATRW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1343,30 +1454,31 @@ LONG WINAPI Emulate_SCardGetStatusChangeA(SmartcardEmulationContext* smartcard,
 	WLog_Print(smartcard->log, smartcard->log_default_level, "SCardGetStatusChangeA { hContext: %p",
 	           (void*)hContext);
 
-	if (dwTimeout == INFINITE)
-		dwTimeout = 60000;
-
 	if (status == SCARD_S_SUCCESS)
 	{
 		const DWORD diff = 100;
-		size_t x;
 		size_t eventCount = 0;
 		SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
 		WINPR_ASSERT(value); /* Must be valid after Emulate_SCardIsValidContext */
 
+		const LONG start = InterlockedIncrement(&value->semaphore);
+
+		const freerdp* inst = freerdp_settings_get_pointer(smartcard->settings, FreeRDP_instance);
+		WINPR_ASSERT(inst);
+
 		status = SCARD_E_TIMEOUT;
 		do
 		{
-			for (x = 0; x < cReaders; x++)
+			for (size_t x = 0; x < cReaders; x++)
 			{
-				size_t y;
 				LPSCARD_READERSTATEA out = &rgReaderStates[x];
 
-				for (y = 0; y < MAX_EMULATED_READERS; y++)
+				for (size_t y = 0; y < MAX_EMULATED_READERS; y++)
 				{
 					const LPSCARD_READERSTATEA in = &value->readerStateA[y];
-					if (strcmp(out->szReader, in->szReader) == 0)
+					if (out->szReader && in->szReader && (strcmp(out->szReader, in->szReader) == 0))
 					{
+						HashTable_Lock(smartcard->handles);
 						const SCardHandle* hdl = find_reader(smartcard, in->szReader, FALSE);
 						out->dwEventState = in->dwEventState;
 						if (hdl)
@@ -1375,7 +1487,7 @@ LONG WINAPI Emulate_SCardGetStatusChangeA(SmartcardEmulationContext* smartcard,
 							if (hdl->dwShareMode == SCARD_SHARE_EXCLUSIVE)
 								out->dwEventState |= SCARD_STATE_EXCLUSIVE;
 						}
-
+						HashTable_Unlock(smartcard->handles);
 						if ((out->dwEventState & SCARD_STATE_EMPTY) !=
 						    (out->dwCurrentState & SCARD_STATE_EMPTY))
 							out->dwEventState |= SCARD_STATE_CHANGED;
@@ -1401,13 +1513,22 @@ LONG WINAPI Emulate_SCardGetStatusChangeA(SmartcardEmulationContext* smartcard,
 				break;
 			}
 			Sleep(diff);
-			dwTimeout -= MIN(dwTimeout, diff);
+			if (dwTimeout != INFINITE)
+				dwTimeout -= MIN(dwTimeout, diff);
+			if (freerdp_shall_disconnect_context(inst->context))
+			{
+				status = SCARD_E_CANCELLED;
+				break;
+			}
 		} while (dwTimeout > 0);
+		const LONG end = InterlockedDecrement(&value->semaphore);
+		WLog_Print(smartcard->log, smartcard->log_default_level,
+		           "[semaphore count] before: %" PRId32 ", after: %" PRId32, start, end);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetStatusChangeA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1421,30 +1542,31 @@ LONG WINAPI Emulate_SCardGetStatusChangeW(SmartcardEmulationContext* smartcard,
 	WLog_Print(smartcard->log, smartcard->log_default_level, "SCardGetStatusChangeW { hContext: %p",
 	           (void*)hContext);
 
-	if (dwTimeout == INFINITE)
-		dwTimeout = 60000;
-
 	if (status == SCARD_S_SUCCESS)
 	{
 		const DWORD diff = 100;
-		size_t x;
 		size_t eventCount = 0;
 		SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
 		WINPR_ASSERT(value); /* Must be valid after Emulate_SCardIsValidContext */
 
+		const LONG start = InterlockedIncrement(&value->semaphore);
+		const freerdp* inst = freerdp_settings_get_pointer(smartcard->settings, FreeRDP_instance);
+		WINPR_ASSERT(inst);
+
 		status = SCARD_E_TIMEOUT;
 		do
 		{
-			for (x = 0; x < cReaders; x++)
+			for (size_t x = 0; x < cReaders; x++)
 			{
-				size_t y;
 				LPSCARD_READERSTATEW out = &rgReaderStates[x];
 
-				for (y = 0; y < MAX_EMULATED_READERS; y++)
+				for (size_t y = 0; y < MAX_EMULATED_READERS; y++)
 				{
 					const LPSCARD_READERSTATEW in = &value->readerStateW[y];
-					if (_wcscmp(out->szReader, in->szReader) == 0)
+					if (out->szReader && in->szReader &&
+					    (_wcscmp(out->szReader, in->szReader) == 0))
 					{
+						HashTable_Lock(smartcard->handles);
 						const SCardHandle* hdl = find_reader(smartcard, in->szReader, TRUE);
 						out->dwEventState = in->dwEventState;
 						if (hdl)
@@ -1453,6 +1575,7 @@ LONG WINAPI Emulate_SCardGetStatusChangeW(SmartcardEmulationContext* smartcard,
 							if (hdl->dwShareMode == SCARD_SHARE_EXCLUSIVE)
 								out->dwEventState |= SCARD_STATE_EXCLUSIVE;
 						}
+						HashTable_Unlock(smartcard->handles);
 						if ((out->dwEventState & SCARD_STATE_EMPTY) !=
 						    (out->dwCurrentState & SCARD_STATE_EMPTY))
 							out->dwEventState |= SCARD_STATE_CHANGED;
@@ -1478,13 +1601,22 @@ LONG WINAPI Emulate_SCardGetStatusChangeW(SmartcardEmulationContext* smartcard,
 				break;
 			}
 			Sleep(diff);
-			dwTimeout -= MIN(dwTimeout, diff);
+			if (dwTimeout != INFINITE)
+				dwTimeout -= MIN(dwTimeout, diff);
+			if (freerdp_shall_disconnect_context(inst->context))
+			{
+				status = SCARD_E_CANCELLED;
+				break;
+			}
 		} while (dwTimeout > 0);
+		const LONG end = InterlockedDecrement(&value->semaphore);
+		WLog_Print(smartcard->log, smartcard->log_default_level,
+		           "[semaphore count] before: %" PRId32 ", after: %" PRId32, start, end);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetStatusChangeW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1501,26 +1633,35 @@ LONG WINAPI Emulate_SCardCancel(SmartcardEmulationContext* smartcard, SCARDCONTE
 		SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
 		WINPR_ASSERT(value);
 		value->canceled = TRUE;
+
+		waitForCancel(value);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
-	           "SCardCancel } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status), status);
+	           "SCardCancel } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
 SCardHandle* find_reader(SmartcardEmulationContext* smartcard, const void* szReader, BOOL unicode)
 {
-	SCardHandle* hdl = NULL;
-	UINT_PTR* keys = NULL;
-	size_t x, count;
+	SCardHandle* hdl = nullptr;
+	ULONG_PTR* keys = nullptr;
 
 	WINPR_ASSERT(smartcard);
-	count = HashTable_GetKeys(smartcard->handles, &keys);
-	for (x = 0; x < count; x++)
+	const size_t count = HashTable_GetKeys(smartcard->handles, &keys);
+	for (size_t x = 0; x < count; x++)
 	{
 		SCardHandle* cur = HashTable_GetItemValue(smartcard->handles, (const void*)keys[x]);
-		WINPR_ASSERT(cur);
+
+		/* HashTable_GetKeys returns a snapshot taken under the lock, and each lookup here takes
+		 * the lock again. A handle disconnected in between -- by the smartcard worker or by
+		 * channel teardown -- is simply gone by now, which is not an invariant violation: skip
+		 * it rather than assert, since WINPR_ASSERT aborts the process and the race only fires
+		 * sometimes. */
+		if (!cur)
+			continue;
 
 		if (cur->unicode != unicode)
 			continue;
@@ -1535,50 +1676,57 @@ SCardHandle* find_reader(SmartcardEmulationContext* smartcard, const void* szRea
 	return hdl;
 }
 
+WINPR_ATTR_MALLOC(scard_handle_free, 1)
 static SCardHandle* reader2handle(SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext,
                                   const void* szReader, BOOL unicode, DWORD dwShareMode,
                                   SCARDHANDLE* phCard, DWORD dwPreferredProtocols,
                                   LPDWORD pdwActiveProtocol)
 {
-	SCardHandle* hdl;
-
 	WINPR_ASSERT(phCard);
+	SCardHandle* hdl = nullptr;
 
 	*phCard = 0;
 	if (Emulate_SCardIsValidContext(smartcard, hContext) != SCARD_S_SUCCESS)
-		return NULL;
+		goto fail;
 
 	hdl = scard_handle_new(smartcard, hContext, szReader, unicode);
-	if (hdl)
-	{
-		winpr_RAND((BYTE*)&hdl->card, sizeof(hdl->card));
-		hdl->dwActiveProtocol = SCARD_PROTOCOL_T1;
-		hdl->dwShareMode = dwShareMode;
+	if (!hdl)
+		goto fail;
 
-		if (!HashTable_Insert(smartcard->handles, (const void*)hdl->card, hdl))
+	if (winpr_RAND(&hdl->card, sizeof(hdl->card)) < 0)
+	{
+		scard_handle_free(hdl);
+		hdl = nullptr;
+		goto fail;
+	}
+	hdl->dwActiveProtocol = SCARD_PROTOCOL_T1;
+	hdl->dwShareMode = dwShareMode;
+
+	DWORD activeProtocol = 0;
+	if (pdwActiveProtocol)
+	{
+		if ((hdl->dwActiveProtocol & dwPreferredProtocols) == 0)
 		{
 			scard_handle_free(hdl);
-			hdl = NULL;
+			hdl = nullptr;
+			goto fail;
 		}
 		else
-		{
-			if (pdwActiveProtocol)
-			{
-				if ((hdl->dwActiveProtocol & dwPreferredProtocols) == 0)
-				{
-					scard_handle_free(hdl);
-					hdl = NULL;
-				}
-				else
-					*pdwActiveProtocol = hdl->dwActiveProtocol;
-			}
-			if (hdl)
-			{
-				hdl->referencecount++;
-				*phCard = hdl->card;
-			}
-		}
+			activeProtocol = hdl->dwActiveProtocol;
 	}
+
+	if (!HashTable_Insert(smartcard->handles, (const void*)hdl->card, hdl))
+	{
+		scard_handle_free(hdl);
+		hdl = nullptr;
+		goto fail;
+	}
+
+	hdl->referencecount++;
+	*pdwActiveProtocol = activeProtocol;
+	*phCard = hdl->card;
+
+fail:
 	WLog_Print(smartcard->log, smartcard->log_default_level, "{ %p }", (void*)*phCard);
 	return hdl;
 }
@@ -1603,7 +1751,8 @@ LONG WINAPI Emulate_SCardConnectA(SmartcardEmulationContext* smartcard, SCARDCON
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
-	           "SCardConnectA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status), status);
+	           "SCardConnectA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1628,14 +1777,16 @@ LONG WINAPI Emulate_SCardConnectW(SmartcardEmulationContext* smartcard, SCARDCON
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
-	           "SCardConnectW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status), status);
+	           "SCardConnectW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
 LONG WINAPI Emulate_SCardReconnect(SmartcardEmulationContext* smartcard, SCARDHANDLE hCard,
-                                   DWORD dwShareMode, DWORD dwPreferredProtocols,
-                                   DWORD dwInitialization, LPDWORD pdwActiveProtocol)
+                                   DWORD dwShareMode, WINPR_ATTR_UNUSED DWORD dwPreferredProtocols,
+                                   WINPR_ATTR_UNUSED DWORD dwInitialization,
+                                   LPDWORD pdwActiveProtocol)
 {
 	LONG status = scard_handle_valid(smartcard, hCard);
 
@@ -1647,6 +1798,7 @@ LONG WINAPI Emulate_SCardReconnect(SmartcardEmulationContext* smartcard, SCARDHA
 
 	if (status == SCARD_S_SUCCESS)
 	{
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 
@@ -1655,11 +1807,12 @@ LONG WINAPI Emulate_SCardReconnect(SmartcardEmulationContext* smartcard, SCARDHA
 		hdl->transaction = FALSE;
 
 		*pdwActiveProtocol = hdl->dwActiveProtocol;
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardReconnect } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1676,17 +1829,19 @@ LONG WINAPI Emulate_SCardDisconnect(SmartcardEmulationContext* smartcard, SCARDH
 
 	if (status == SCARD_S_SUCCESS)
 	{
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 
 		hdl->referencecount--;
 		if (hdl->referencecount == 0)
 			HashTable_Remove(smartcard->handles, (const void*)hCard);
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardDisconnect } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1700,17 +1855,19 @@ LONG WINAPI Emulate_SCardBeginTransaction(SmartcardEmulationContext* smartcard, 
 
 	if (status == SCARD_S_SUCCESS)
 	{
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 		if (hdl->transaction)
 			status = SCARD_E_INVALID_VALUE;
 		else
 			hdl->transaction = TRUE;
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardBeginTransaction } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1727,17 +1884,19 @@ LONG WINAPI Emulate_SCardEndTransaction(SmartcardEmulationContext* smartcard, SC
 
 	if (status == SCARD_S_SUCCESS)
 	{
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 		if (!hdl->transaction)
 			status = SCARD_E_NOT_TRANSACTED;
 		else
 			hdl->transaction = FALSE;
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardEndTransaction } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1751,17 +1910,19 @@ LONG WINAPI Emulate_SCardCancelTransaction(SmartcardEmulationContext* smartcard,
 
 	if (status == SCARD_S_SUCCESS)
 	{
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 		if (!hdl->transaction)
 			status = SCARD_E_NOT_TRANSACTED;
 		else
 			hdl->transaction = FALSE;
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardCancelTransaction } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1780,6 +1941,7 @@ LONG WINAPI Emulate_SCardState(SmartcardEmulationContext* smartcard, SCARDHANDLE
 
 	if (status == SCARD_S_SUCCESS)
 	{
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 
@@ -1790,12 +1952,11 @@ LONG WINAPI Emulate_SCardState(SmartcardEmulationContext* smartcard, SCARDHANDLE
 
 		if (pcbAtrLen)
 		{
-			size_t x;
 			SCardContext* ctx =
 			    HashTable_GetItemValue(smartcard->contexts, (const void*)hdl->hContext);
 			WINPR_ASSERT(ctx);
 
-			for (x = 0; x < MAX_EMULATED_READERS; x++)
+			for (size_t x = 0; x < MAX_EMULATED_READERS; x++)
 			{
 				const SCARD_READERSTATEA* readerA = &ctx->readerStateA[x];
 				const SCARD_READERSTATEW* readerW = &ctx->readerStateW[x];
@@ -1817,10 +1978,12 @@ LONG WINAPI Emulate_SCardState(SmartcardEmulationContext* smartcard, SCARDHANDLE
 				}
 			}
 		}
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
-	           "SCardState } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status), status);
+	           "SCardState } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1836,7 +1999,8 @@ LONG WINAPI Emulate_SCardStatusA(SmartcardEmulationContext* smartcard, SCARDHAND
 
 	if (status == SCARD_S_SUCCESS)
 	{
-		SCardContext* ctx;
+		SCardContext* ctx = nullptr;
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 
@@ -1855,9 +2019,7 @@ LONG WINAPI Emulate_SCardStatusA(SmartcardEmulationContext* smartcard, SCARDHAND
 
 		if (pcbAtrLen)
 		{
-			size_t x;
-
-			for (x = 0; x < MAX_EMULATED_READERS; x++)
+			for (size_t x = 0; x < MAX_EMULATED_READERS; x++)
 			{
 				const SCARD_READERSTATEA* reader = &ctx->readerStateA[x];
 				if (strcmp(reader->szReader, hdl->szReader.pc) == 0)
@@ -1867,10 +2029,12 @@ LONG WINAPI Emulate_SCardStatusA(SmartcardEmulationContext* smartcard, SCARDHAND
 				}
 			}
 		}
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
-	           "SCardStatusA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status), status);
+	           "SCardStatusA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1886,7 +2050,8 @@ LONG WINAPI Emulate_SCardStatusW(SmartcardEmulationContext* smartcard, SCARDHAND
 
 	if (status == SCARD_S_SUCCESS)
 	{
-		SCardContext* ctx;
+		SCardContext* ctx = nullptr;
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 
@@ -1906,9 +2071,7 @@ LONG WINAPI Emulate_SCardStatusW(SmartcardEmulationContext* smartcard, SCARDHAND
 
 		if (pcbAtrLen)
 		{
-			size_t x;
-
-			for (x = 0; x < MAX_EMULATED_READERS; x++)
+			for (size_t x = 0; x < MAX_EMULATED_READERS; x++)
 			{
 				const SCARD_READERSTATEW* reader = &ctx->readerStateW[x];
 				if (_wcscmp(reader->szReader, hdl->szReader.pw) == 0)
@@ -1916,10 +2079,12 @@ LONG WINAPI Emulate_SCardStatusW(SmartcardEmulationContext* smartcard, SCARDHAND
 					    scard_copy_strings(ctx, pbAtr, *pcbAtrLen, reader->rgbAtr, reader->cbAtr);
 			}
 		}
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
-	           "SCardStatusW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status), status);
+	           "SCardStatusW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1939,8 +2104,9 @@ LONG WINAPI Emulate_SCardTransmit(SmartcardEmulationContext* smartcard, SCARDHAN
 
 	if (status == SCARD_S_SUCCESS)
 	{
-		BYTE* response = NULL;
+		BYTE* response = nullptr;
 		DWORD responseSize = 0;
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 
@@ -1962,10 +2128,12 @@ LONG WINAPI Emulate_SCardTransmit(SmartcardEmulationContext* smartcard, SCARDHAN
 			if (pioRecvPci)
 				pioRecvPci->dwProtocol = hdl->dwActiveProtocol;
 		}
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
-	           "SCardTransmit } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status), status);
+	           "SCardTransmit } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -1983,22 +2151,25 @@ LONG WINAPI Emulate_SCardGetTransmitCount(SmartcardEmulationContext* smartcard, 
 
 	if (status == SCARD_S_SUCCESS)
 	{
+		HashTable_Lock(smartcard->handles);
 		SCardHandle* hdl = HashTable_GetItemValue(smartcard->handles, (const void*)hCard);
 		WINPR_ASSERT(hdl);
 
 		*pcTransmitCount = hdl->transmitcount;
+		HashTable_Unlock(smartcard->handles);
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetTransmitCount } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardControl(SmartcardEmulationContext* smartcard, SCARDHANDLE hCard,
-                                 DWORD dwControlCode, LPCVOID lpInBuffer, DWORD cbInBufferSize,
-                                 LPVOID lpOutBuffer, DWORD cbOutBufferSize, LPDWORD lpBytesReturned)
+LONG WINAPI Emulate_SCardControl(
+    SmartcardEmulationContext* smartcard, SCARDHANDLE hCard, DWORD dwControlCode,
+    LPCVOID lpInBuffer, DWORD cbInBufferSize, LPVOID lpOutBuffer, DWORD cbOutBufferSize,
+    LPDWORD lpBytesReturned /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = scard_handle_valid(smartcard, hCard);
 
@@ -2019,13 +2190,16 @@ LONG WINAPI Emulate_SCardControl(SmartcardEmulationContext* smartcard, SCARDHAND
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
-	           "SCardControl } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status), status);
+	           "SCardControl } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
 LONG WINAPI Emulate_SCardGetAttrib(SmartcardEmulationContext* smartcard, SCARDHANDLE hCard,
-                                   DWORD dwAttrId, LPBYTE pbAttr, LPDWORD pcbAttrLen)
+                                   DWORD dwAttrId,
+                                   LPBYTE pbAttr /* NOLINT(readability-non-const-parameter) */,
+                                   LPDWORD pcbAttrLen /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = scard_handle_valid(smartcard, hCard);
 
@@ -2037,11 +2211,12 @@ LONG WINAPI Emulate_SCardGetAttrib(SmartcardEmulationContext* smartcard, SCARDHA
 	WINPR_UNUSED(pcbAttrLen);
 
 	/* Not required, return not supported */
-	status = SCARD_F_INTERNAL_ERROR;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_F_INTERNAL_ERROR;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetAttrib } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2059,11 +2234,12 @@ LONG WINAPI Emulate_SCardSetAttrib(SmartcardEmulationContext* smartcard, SCARDHA
 	WINPR_UNUSED(cbAttrLen);
 
 	/* Not required, return not supported */
-	status = SCARD_F_INTERNAL_ERROR;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_F_INTERNAL_ERROR;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardSetAttrib } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2071,7 +2247,7 @@ LONG WINAPI Emulate_SCardSetAttrib(SmartcardEmulationContext* smartcard, SCARDHA
 LONG WINAPI Emulate_SCardUIDlgSelectCardA(SmartcardEmulationContext* smartcard,
                                           LPOPENCARDNAMEA_EX pDlgStruc)
 {
-	LONG status;
+	LONG status = 0;
 
 	WINPR_ASSERT(smartcard);
 
@@ -2084,7 +2260,7 @@ LONG WINAPI Emulate_SCardUIDlgSelectCardA(SmartcardEmulationContext* smartcard,
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardUIDlgSelectCardA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2092,7 +2268,7 @@ LONG WINAPI Emulate_SCardUIDlgSelectCardA(SmartcardEmulationContext* smartcard,
 LONG WINAPI Emulate_SCardUIDlgSelectCardW(SmartcardEmulationContext* smartcard,
                                           LPOPENCARDNAMEW_EX pDlgStruc)
 {
-	LONG status;
+	LONG status = 0;
 
 	WINPR_ASSERT(smartcard);
 
@@ -2105,7 +2281,7 @@ LONG WINAPI Emulate_SCardUIDlgSelectCardW(SmartcardEmulationContext* smartcard,
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardUIDlgSelectCardW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2113,7 +2289,7 @@ LONG WINAPI Emulate_SCardUIDlgSelectCardW(SmartcardEmulationContext* smartcard,
 LONG WINAPI Emulate_GetOpenCardNameA(SmartcardEmulationContext* smartcard,
                                      LPOPENCARDNAMEA pDlgStruc)
 {
-	LONG status;
+	LONG status = 0;
 
 	WINPR_ASSERT(smartcard);
 
@@ -2126,7 +2302,7 @@ LONG WINAPI Emulate_GetOpenCardNameA(SmartcardEmulationContext* smartcard,
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "GetOpenCardNameA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2134,7 +2310,7 @@ LONG WINAPI Emulate_GetOpenCardNameA(SmartcardEmulationContext* smartcard,
 LONG WINAPI Emulate_GetOpenCardNameW(SmartcardEmulationContext* smartcard,
                                      LPOPENCARDNAMEW pDlgStruc)
 {
-	LONG status;
+	LONG status = 0;
 
 	WINPR_ASSERT(smartcard);
 
@@ -2147,14 +2323,14 @@ LONG WINAPI Emulate_GetOpenCardNameW(SmartcardEmulationContext* smartcard,
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "GetOpenCardNameW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
 LONG WINAPI Emulate_SCardDlgExtendedError(SmartcardEmulationContext* smartcard)
 {
-	LONG status;
+	LONG status = 0;
 
 	WINPR_ASSERT(smartcard);
 
@@ -2165,7 +2341,7 @@ LONG WINAPI Emulate_SCardDlgExtendedError(SmartcardEmulationContext* smartcard)
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardDlgExtendedError } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2191,11 +2367,15 @@ LONG WINAPI Emulate_SCardReadCacheA(SmartcardEmulationContext* smartcard, SCARDC
 
 	if (status == SCARD_S_SUCCESS)
 	{
-		SCardCacheItem* data;
+		SCardCacheItem* data = nullptr;
 		SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
 		WINPR_ASSERT(value); /* Must be valid after Emulate_SCardIsValidContext */
 
-		data = HashTable_GetItemValue(value->cacheA, LookupName);
+		char* id = card_id_and_name_a(CardIdentifier, LookupName);
+		if (id)
+			data = HashTable_GetItemValue(value->cache, id);
+		free(id);
+
 		if (!data)
 			status = SCARD_W_CACHE_ITEM_NOT_FOUND;
 		else if (data->freshness != FreshnessCounter)
@@ -2206,7 +2386,7 @@ LONG WINAPI Emulate_SCardReadCacheA(SmartcardEmulationContext* smartcard, SCARDC
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardReadCacheA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2232,11 +2412,13 @@ LONG WINAPI Emulate_SCardReadCacheW(SmartcardEmulationContext* smartcard, SCARDC
 
 	if (status == SCARD_S_SUCCESS)
 	{
-		SCardCacheItem* data;
+		SCardCacheItem* data = nullptr;
 		SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
 		WINPR_ASSERT(value); /* Must be valid after Emulate_SCardIsValidContext */
 
-		data = HashTable_GetItemValue(value->cacheW, LookupName);
+		char* id = card_id_and_name_w(CardIdentifier, LookupName);
+		data = HashTable_GetItemValue(value->cache, id);
+		free(id);
 		if (!data)
 			status = SCARD_W_CACHE_ITEM_NOT_FOUND;
 		else if (data->freshness != FreshnessCounter)
@@ -2247,16 +2429,17 @@ LONG WINAPI Emulate_SCardReadCacheW(SmartcardEmulationContext* smartcard, SCARDC
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardReadCacheW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-static BOOL insert_data(wHashTable* table, DWORD FreshnessCounter, const void* key,
+WINPR_ATTR_NODISCARD
+static LONG insert_data(wHashTable* table, DWORD FreshnessCounter, const char* key,
                         const PBYTE Data, DWORD DataLen)
 {
-	BOOL rc;
-	SCardCacheItem* item;
+	BOOL rc = 0;
+	SCardCacheItem* item = nullptr;
 
 	WINPR_ASSERT(table);
 	WINPR_ASSERT(key);
@@ -2287,6 +2470,8 @@ static BOOL insert_data(wHashTable* table, DWORD FreshnessCounter, const void* k
 	item->freshness = FreshnessCounter;
 	item->size = DataLen;
 	memcpy(item->data, Data, DataLen);
+
+	// NOLINTNEXTLINE(clang-analyzer-unix.Malloc): HashTable_Insert takes ownership of item
 	return SCARD_S_SUCCESS;
 }
 
@@ -2307,12 +2492,19 @@ LONG WINAPI Emulate_SCardWriteCacheA(SmartcardEmulationContext* smartcard, SCARD
 		SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
 		WINPR_ASSERT(value); /* Must be valid after Emulate_SCardIsValidContext */
 
-		status = insert_data(value->cacheA, FreshnessCounter, LookupName, Data, DataLen);
+		char* id = card_id_and_name_a(CardIdentifier, LookupName);
+		if (!id)
+			status = SCARD_E_NO_MEMORY;
+		else
+		{
+			status = insert_data(value->cache, FreshnessCounter, id, Data, DataLen);
+			free(id);
+		}
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardWriteCacheA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2334,12 +2526,19 @@ LONG WINAPI Emulate_SCardWriteCacheW(SmartcardEmulationContext* smartcard, SCARD
 		SCardContext* value = HashTable_GetItemValue(smartcard->contexts, (const void*)hContext);
 		WINPR_ASSERT(value); /* Must be valid after Emulate_SCardIsValidContext */
 
-		status = insert_data(value->cacheW, FreshnessCounter, LookupName, Data, DataLen);
+		char* id = card_id_and_name_w(CardIdentifier, LookupName);
+		if (!id)
+			status = SCARD_E_NO_MEMORY;
+		else
+		{
+			status = insert_data(value->cache, FreshnessCounter, id, Data, DataLen);
+			free(id);
+		}
 	}
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardWriteCacheW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2372,7 +2571,7 @@ LONG WINAPI Emulate_SCardGetReaderIconA(SmartcardEmulationContext* smartcard, SC
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetReaderIconA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2405,7 +2604,7 @@ LONG WINAPI Emulate_SCardGetReaderIconW(SmartcardEmulationContext* smartcard, SC
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetReaderIconW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2432,7 +2631,7 @@ LONG WINAPI Emulate_SCardGetDeviceTypeIdA(SmartcardEmulationContext* smartcard,
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetDeviceTypeIdA } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2459,15 +2658,15 @@ LONG WINAPI Emulate_SCardGetDeviceTypeIdW(SmartcardEmulationContext* smartcard,
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetDeviceTypeIdW } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
-	           status);
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardGetReaderDeviceInstanceIdA(SmartcardEmulationContext* smartcard,
-                                                    SCARDCONTEXT hContext, LPCSTR szReaderName,
-                                                    LPSTR szDeviceInstanceId,
-                                                    LPDWORD pcchDeviceInstanceId)
+LONG WINAPI Emulate_SCardGetReaderDeviceInstanceIdA(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext, LPCSTR szReaderName,
+    LPSTR szDeviceInstanceId /* NOLINT(readability-non-const-parameter) */,
+    LPDWORD pcchDeviceInstanceId /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -2481,19 +2680,20 @@ LONG WINAPI Emulate_SCardGetReaderDeviceInstanceIdA(SmartcardEmulationContext* s
 	WINPR_UNUSED(pcchDeviceInstanceId);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetReaderDeviceInstanceIdA } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardGetReaderDeviceInstanceIdW(SmartcardEmulationContext* smartcard,
-                                                    SCARDCONTEXT hContext, LPCWSTR szReaderName,
-                                                    LPWSTR szDeviceInstanceId,
-                                                    LPDWORD pcchDeviceInstanceId)
+LONG WINAPI Emulate_SCardGetReaderDeviceInstanceIdW(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext, LPCWSTR szReaderName,
+    LPWSTR szDeviceInstanceId /* NOLINT(readability-non-const-parameter) */,
+    LPDWORD pcchDeviceInstanceId /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -2507,19 +2707,20 @@ LONG WINAPI Emulate_SCardGetReaderDeviceInstanceIdW(SmartcardEmulationContext* s
 	WINPR_UNUSED(pcchDeviceInstanceId);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardGetReaderDeviceInstanceIdW } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardListReadersWithDeviceInstanceIdA(SmartcardEmulationContext* smartcard,
-                                                          SCARDCONTEXT hContext,
-                                                          LPCSTR szDeviceInstanceId,
-                                                          LPSTR mszReaders, LPDWORD pcchReaders)
+LONG WINAPI Emulate_SCardListReadersWithDeviceInstanceIdA(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext, LPCSTR szDeviceInstanceId,
+    LPSTR mszReaders /* NOLINT(readability-non-const-parameter) */,
+    LPDWORD pcchReaders /* NOLINT(readability-non-const-parameter) */)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -2531,19 +2732,19 @@ LONG WINAPI Emulate_SCardListReadersWithDeviceInstanceIdA(SmartcardEmulationCont
 	WINPR_UNUSED(pcchReaders);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListReadersWithDeviceInstanceIdA } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
-LONG WINAPI Emulate_SCardListReadersWithDeviceInstanceIdW(SmartcardEmulationContext* smartcard,
-                                                          SCARDCONTEXT hContext,
-                                                          LPCWSTR szDeviceInstanceId,
-                                                          LPWSTR mszReaders, LPDWORD pcchReaders)
+LONG WINAPI Emulate_SCardListReadersWithDeviceInstanceIdW(
+    SmartcardEmulationContext* smartcard, SCARDCONTEXT hContext, LPCWSTR szDeviceInstanceId,
+    LPWSTR mszReaders /* NOLINT(readability-non-const-parameter) */, LPDWORD pcchReaders)
 {
 	LONG status = Emulate_SCardIsValidContext(smartcard, hContext);
 
@@ -2555,11 +2756,12 @@ LONG WINAPI Emulate_SCardListReadersWithDeviceInstanceIdW(SmartcardEmulationCont
 	WINPR_UNUSED(pcchReaders);
 
 	/* Not required, return not supported */
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
 	           "SCardListReadersWithDeviceInstanceIdW } status: %s (0x%08" PRIX32 ")",
-	           SCardGetErrorString(status), status);
+	           SCardGetErrorString(status), WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
@@ -2575,14 +2777,17 @@ LONG WINAPI Emulate_SCardAudit(SmartcardEmulationContext* smartcard, SCARDCONTEX
 	           (void*)hContext);
 
 	// TODO: Implement
-	status = SCARD_E_UNSUPPORTED_FEATURE;
+	if (status == SCARD_S_SUCCESS)
+		status = SCARD_E_UNSUPPORTED_FEATURE;
 
 	WLog_Print(smartcard->log, smartcard->log_default_level,
-	           "SCardAudit } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status), status);
+	           "SCardAudit } status: %s (0x%08" PRIX32 ")", SCardGetErrorString(status),
+	           WINPR_CXX_COMPAT_CAST(UINT32, status));
 
 	return status;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL context_equals(const void* pva, const void* pvb)
 {
 	const SCARDCONTEXT a = (const SCARDCONTEXT)pva;
@@ -2595,6 +2800,7 @@ static BOOL context_equals(const void* pva, const void* pvb)
 	return a == b;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL handle_equals(const void* pva, const void* pvb)
 {
 	const SCARDHANDLE a = (const SCARDHANDLE)pva;
@@ -2607,9 +2813,42 @@ static BOOL handle_equals(const void* pva, const void* pvb)
 	return a == b;
 }
 
+static void entry_free(void* ptr)
+{
+	SmartcardPinCounterEntry* entry = ptr;
+	if (!entry)
+		return;
+
+	winpr_zfree(entry->pin);
+	free(entry);
+}
+
+WINPR_ATTR_MALLOC(entry_free, 1)
+static void* entry_clone(const void* other)
+{
+	const SmartcardPinCounterEntry* entry = other;
+	if (!entry)
+		return nullptr;
+
+	SmartcardPinCounterEntry* clone = calloc(1, sizeof(SmartcardPinCounterEntry));
+	if (!clone)
+		return nullptr;
+	*clone = *entry;
+	if (entry->pin)
+	{
+		clone->pin = _strdup(entry->pin);
+		if (!clone->pin)
+		{
+			entry_free(clone);
+			return nullptr;
+		}
+	}
+	return clone;
+}
+
 SmartcardEmulationContext* Emulate_New(const rdpSettings* settings)
 {
-	SmartcardEmulationContext* smartcard;
+	SmartcardEmulationContext* smartcard = nullptr;
 
 	WINPR_ASSERT(settings);
 
@@ -2641,7 +2880,7 @@ SmartcardEmulationContext* Emulate_New(const rdpSettings* settings)
 		obj->fnObjectFree = scard_context_free;
 	}
 
-	smartcard->handles = HashTable_New(FALSE);
+	smartcard->handles = HashTable_New(TRUE);
 	if (!smartcard->handles)
 		goto fail;
 	else
@@ -2659,11 +2898,27 @@ SmartcardEmulationContext* Emulate_New(const rdpSettings* settings)
 		obj->fnObjectFree = scard_handle_free;
 	}
 
+	smartcard->pinCounters = HashTable_New(TRUE);
+	if (!smartcard->pinCounters)
+		goto fail;
+	else if (!HashTable_SetupForStringData(smartcard->pinCounters, FALSE))
+		goto fail;
+	else
+	{
+		wObject* obj = HashTable_ValueObject(smartcard->pinCounters);
+		WINPR_ASSERT(obj);
+		obj->fnObjectEquals = nullptr;
+		obj->fnObjectFree = entry_free;
+		obj->fnObjectNew = entry_clone;
+	}
 	return smartcard;
 
 fail:
+	WINPR_PRAGMA_DIAG_PUSH
+	WINPR_PRAGMA_DIAG_IGNORED_MISMATCHED_DEALLOC
 	Emulate_Free(smartcard);
-	return NULL;
+	WINPR_PRAGMA_DIAG_POP
+	return nullptr;
 }
 
 void Emulate_Free(SmartcardEmulationContext* context)
@@ -2673,16 +2928,17 @@ void Emulate_Free(SmartcardEmulationContext* context)
 
 	HashTable_Free(context->handles);
 	HashTable_Free(context->contexts);
+	HashTable_Free(context->pinCounters);
 	free(context);
 }
 
 BOOL Emulate_IsConfigured(SmartcardEmulationContext* context)
 {
 	BOOL rc = FALSE;
-	vgidsContext* vgids;
-	const char* pem = NULL;
-	const char* key = NULL;
-	const char* pin = NULL;
+	vgidsContext* vgids = nullptr;
+	const char* pem = nullptr;
+	const char* key = nullptr;
+	const char* pin = nullptr;
 
 	WINPR_ASSERT(context);
 
@@ -2698,11 +2954,79 @@ BOOL Emulate_IsConfigured(SmartcardEmulationContext* context)
 	context->key = key;
 	context->pin = pin;
 
-	vgids = vgids_new();
+	vgids = vgids_new(context);
 	if (vgids)
 		rc = vgids_init(vgids, context->pem, context->key, context->pin);
 	vgids_free(vgids);
 
 	context->configured = rc;
+	return rc;
+}
+
+BOOL Emulate_SetupPin(SmartcardEmulationContext* context, const char* name, const char* pin)
+{
+	WINPR_ASSERT(context);
+
+	const SmartcardPinCounterEntry entry = { .curRetryCounter = VGIDS_DEFAULT_RETRY_COUNTER,
+		                                     .retryCounter = VGIDS_DEFAULT_RETRY_COUNTER,
+		                                     .pin = WINPR_CAST_CONST_PTR_AWAY(pin, char*) };
+
+	BOOL rc = FALSE;
+	HashTable_Lock(context->pinCounters);
+	const SmartcardPinCounterEntry* val = HashTable_GetItemValue(context->pinCounters, name);
+	if (!val)
+		rc = HashTable_Insert(context->pinCounters, name, &entry);
+	else
+	{
+		if (val->pin && pin)
+			rc = strcmp(val->pin, pin) == 0;
+	}
+	HashTable_Unlock(context->pinCounters);
+	return rc;
+}
+
+BOOL Emulate_IsPinValid(SmartcardEmulationContext* context, const char* name, const char* pin,
+                        size_t bytelen, UINT16* remaining)
+{
+	WINPR_ASSERT(context);
+	WINPR_ASSERT(remaining);
+
+	*remaining = 0;
+
+	BOOL rc = FALSE;
+	HashTable_Lock(context->pinCounters);
+	SmartcardPinCounterEntry* val = HashTable_GetItemValue(context->pinCounters, name);
+	if (val)
+	{
+		if (val->pin && pin)
+		{
+			const size_t min = strlen(val->pin);
+			if (bytelen >= min)
+				rc = strncmp(val->pin, pin, min + 1) == 0;
+		}
+		if (!rc)
+		{
+			if (val->curRetryCounter > 0)
+				val->curRetryCounter--;
+			else
+				val->curRetryCounter = val->retryCounter;
+		}
+		*remaining = val->curRetryCounter;
+	}
+
+	HashTable_Unlock(context->pinCounters);
+	return rc;
+}
+
+BOOL Emulate_IsPinBlocked(SmartcardEmulationContext* context, const char* name)
+{
+	WINPR_ASSERT(context);
+
+	BOOL rc = FALSE;
+	HashTable_Lock(context->pinCounters);
+	const SmartcardPinCounterEntry* val = HashTable_GetItemValue(context->pinCounters, name);
+	if (val)
+		rc = val->curRetryCounter == 0;
+	HashTable_Unlock(context->pinCounters);
 	return rc;
 }

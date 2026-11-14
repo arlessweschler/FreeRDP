@@ -20,6 +20,8 @@
 #ifndef FREERDP_LIB_CORE_CLIENT_H
 #define FREERDP_LIB_CORE_CLIENT_H
 
+#include <freerdp/config.h>
+
 #include <winpr/crt.h>
 #include <winpr/stream.h>
 #include <winpr/wtsapi.h>
@@ -42,8 +44,8 @@
 
 typedef struct
 {
-	PVIRTUALCHANNELENTRY entry;
-	PVIRTUALCHANNELENTRYEX entryEx;
+	WINPR_ATTR_NODISCARD PVIRTUALCHANNELENTRY entry;
+	WINPR_ATTR_NODISCARD PVIRTUALCHANNELENTRYEX entryEx;
 	PCHANNEL_INIT_EVENT_FN pChannelInitEventProc;
 	PCHANNEL_INIT_EVENT_EX_FN pChannelInitEventProcEx;
 	void* pInitHandle;
@@ -52,15 +54,23 @@ typedef struct
 
 typedef struct
 {
-	char name[CHANNEL_NAME_LEN + 1];
-	int OpenHandle;
-	int options;
+	StaticClientChannelStat stats;
+	ULONG options;
 	int flags;
 	void* pInterface;
 	rdpChannels* channels;
 	void* lpUserParam;
 	PCHANNEL_OPEN_EVENT_FN pChannelOpenEventProc;
 	PCHANNEL_OPEN_EVENT_EX_FN pChannelOpenEventProcEx;
+#if defined(WITH_RDPEUDP)
+	/* The dynamic channel the data is sent on instead, see freerdp_channels_set_static_bridge.
+	 * Set under channels->channelsLock. */
+	struct rdp_channel_bridge* bridge;
+	/* Once a static channel is tunnelled its original transport must not be used again.
+	 * dataLock serializes delivery with the transition to the tunnel. */
+	BOOL tunneled;
+	CRITICAL_SECTION dataLock;
+#endif
 } CHANNEL_OPEN_DATA;
 
 typedef struct
@@ -107,13 +117,34 @@ struct rdp_channels
 
 	DrdynvcClientContext* drdynvc;
 	CRITICAL_SECTION channelsLock;
+#if defined(WITH_RDPEUDP)
+	size_t dataLockCount;
+#endif
+
+	wHashTable* channelEvents;
 };
 
-FREERDP_LOCAL rdpChannels* freerdp_channels_new(freerdp* instance);
-FREERDP_LOCAL UINT freerdp_channels_disconnect(rdpChannels* channels, freerdp* instance);
-FREERDP_LOCAL void freerdp_channels_close(rdpChannels* channels, freerdp* instance);
 FREERDP_LOCAL void freerdp_channels_free(rdpChannels* channels);
+
+WINPR_ATTR_MALLOC(freerdp_channels_free, 1)
+FREERDP_LOCAL rdpChannels* freerdp_channels_new(freerdp* instance);
+
+FREERDP_LOCAL UINT freerdp_channels_disconnect(rdpChannels* channels, freerdp* instance);
+
+FREERDP_LOCAL void freerdp_channels_close(rdpChannels* channels, freerdp* instance);
+
 FREERDP_LOCAL void freerdp_channels_register_instance(rdpChannels* channels, freerdp* instance);
+
+WINPR_ATTR_NODISCARD
 FREERDP_LOCAL UINT freerdp_channels_pre_connect(rdpChannels* channels, freerdp* instance);
+
+WINPR_ATTR_NODISCARD
 FREERDP_LOCAL UINT freerdp_channels_post_connect(rdpChannels* channels, freerdp* instance);
+
+/** @since version 3.9.0 */
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL SSIZE_T freerdp_client_channel_get_registered_event_handles(rdpChannels* channels,
+                                                                          HANDLE* events,
+                                                                          DWORD count);
+
 #endif /* FREERDP_LIB_CORE_CLIENT_H */

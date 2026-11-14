@@ -24,36 +24,47 @@
 #include <freerdp/dvc.h>
 #include <freerdp/types.h>
 
+/** The command line name of the channel
+ *
+ *  \since version 3.0.0
+ */
+#define RDPECAM_CHANNEL_NAME "rdpecam"
 #define RDPECAM_DVC_CHANNEL_NAME "rdpecam"
 #define RDPECAM_CONTROL_DVC_CHANNEL_NAME "RDCamera_Device_Enumerator"
 
-typedef enum
+#ifdef __cplusplus
+extern "C"
 {
-	CAM_MSG_ID_SuccessResponse = 0x01,
-	CAM_MSG_ID_ErrorResponse = 0x02,
-	CAM_MSG_ID_SelectVersionRequest = 0x03,
-	CAM_MSG_ID_SelectVersionResponse = 0x04,
-	CAM_MSG_ID_DeviceAddedNotification = 0x05,
-	CAM_MSG_ID_DeviceRemovedNotification = 0x06,
-	CAM_MSG_ID_ActivateDeviceRequest = 0x07,
-	CAM_MSG_ID_DeactivateDeviceRequest = 0x08,
-	CAM_MSG_ID_StreamListRequest = 0x09,
-	CAM_MSG_ID_StreamListResponse = 0x0A,
-	CAM_MSG_ID_MediaTypeListRequest = 0x0B,
-	CAM_MSG_ID_MediaTypeListResponse = 0x0C,
-	CAM_MSG_ID_CurrentMediaTypeRequest = 0x0D,
-	CAM_MSG_ID_CurrentMediaTypeResponse = 0x0E,
-	CAM_MSG_ID_StartStreamsRequest = 0x0F,
-	CAM_MSG_ID_StopStreamsRequest = 0x10,
-	CAM_MSG_ID_SampleRequest = 0x11,
-	CAM_MSG_ID_SampleResponse = 0x12,
-	CAM_MSG_ID_SampleErrorResponse = 0x13,
-	CAM_MSG_ID_PropertyListRequest = 0x14,
-	CAM_MSG_ID_PropertyListResponse = 0x15,
-	CAM_MSG_ID_PropertyValueRequest = 0x16,
-	CAM_MSG_ID_PropertyValueResponse = 0x17,
-	CAM_MSG_ID_SetPropertyValueRequest = 0x18,
-} CAM_MSG_ID;
+#endif
+
+	typedef enum
+	{
+		CAM_MSG_ID_Invalid = 0x00,
+		CAM_MSG_ID_SuccessResponse = 0x01,
+		CAM_MSG_ID_ErrorResponse = 0x02,
+		CAM_MSG_ID_SelectVersionRequest = 0x03,
+		CAM_MSG_ID_SelectVersionResponse = 0x04,
+		CAM_MSG_ID_DeviceAddedNotification = 0x05,
+		CAM_MSG_ID_DeviceRemovedNotification = 0x06,
+		CAM_MSG_ID_ActivateDeviceRequest = 0x07,
+		CAM_MSG_ID_DeactivateDeviceRequest = 0x08,
+		CAM_MSG_ID_StreamListRequest = 0x09,
+		CAM_MSG_ID_StreamListResponse = 0x0A,
+		CAM_MSG_ID_MediaTypeListRequest = 0x0B,
+		CAM_MSG_ID_MediaTypeListResponse = 0x0C,
+		CAM_MSG_ID_CurrentMediaTypeRequest = 0x0D,
+		CAM_MSG_ID_CurrentMediaTypeResponse = 0x0E,
+		CAM_MSG_ID_StartStreamsRequest = 0x0F,
+		CAM_MSG_ID_StopStreamsRequest = 0x10,
+		CAM_MSG_ID_SampleRequest = 0x11,
+		CAM_MSG_ID_SampleResponse = 0x12,
+		CAM_MSG_ID_SampleErrorResponse = 0x13,
+		CAM_MSG_ID_PropertyListRequest = 0x14,
+		CAM_MSG_ID_PropertyListResponse = 0x15,
+		CAM_MSG_ID_PropertyValueRequest = 0x16,
+		CAM_MSG_ID_PropertyValueResponse = 0x17,
+		CAM_MSG_ID_SetPropertyValueRequest = 0x18,
+	} CAM_MSG_ID;
 
 #define CAM_HEADER_SIZE 2
 
@@ -97,6 +108,7 @@ typedef struct
 
 typedef enum
 {
+	CAM_ERROR_CODE_None = 0x00000000,
 	CAM_ERROR_CODE_UnexpectedError = 0x00000001,
 	CAM_ERROR_CODE_InvalidMessage = 0x00000002,
 	CAM_ERROR_CODE_NotInitialized = 0x00000003,
@@ -165,6 +177,7 @@ typedef struct
 
 typedef enum
 {
+	CAM_MEDIA_FORMAT_INVALID = 0x00,
 	CAM_MEDIA_FORMAT_H264 = 0x01,
 	CAM_MEDIA_FORMAT_MJPG = 0x02,
 	CAM_MEDIA_FORMAT_YUY2 = 0x03,
@@ -176,6 +189,7 @@ typedef enum
 
 typedef enum
 {
+	AM_MEDIA_TYPE_DESCRIPTION_FLAG_Invalid = 0x00,
 	CAM_MEDIA_TYPE_DESCRIPTION_FLAG_DecodingRequired = 0x01,
 	CAM_MEDIA_TYPE_DESCRIPTION_FLAG_BottomUpImage = 0x02,
 } CAM_MEDIA_TYPE_DESCRIPTION_FLAGS;
@@ -258,35 +272,41 @@ typedef struct
 typedef enum
 {
 	CAM_PROPERTY_SET_CameraControl = 0x01,
-	CAM_PROPERTY_SET_VideoProcAmp = 0x02,
+	CAM_PROPERTY_SET_VideoProcAmp = 0x02
 } CAM_PROPERTY_SET;
 
 /* CameraControl properties */
-#define CAM_PROPERTY_ID_CAMERA_CONTROL_Exposure 0x01
-#define CAM_PROPERTY_ID_CAMERA_CONTROL_Focus 0x02
-#define CAM_PROPERTY_ID_CAMERA_CONTROL_Pan 0x03
-#define CAM_PROPERTY_ID_CAMERA_CONTROL_Roll 0x04
-#define CAM_PROPERTY_ID_CAMERA_CONTROL_Tilt 0x05
-#define CAM_PROPERTY_ID_CAMERA_CONTROL_Zoom 0x06
+typedef enum
+{
+	CAM_PROPERTY_ID_CAMERA_CONTROL_Exposure = 0x01,
+	CAM_PROPERTY_ID_CAMERA_CONTROL_Focus = 0x02,
+	CAM_PROPERTY_ID_CAMERA_CONTROL_Pan = 0x03,
+	CAM_PROPERTY_ID_CAMERA_CONTROL_Roll = 0x04,
+	CAM_PROPERTY_ID_CAMERA_CONTROL_Tilt = 0x05,
+	CAM_PROPERTY_ID_CAMERA_CONTROL_Zoom = 0x06
+} CAM_PROPERTY_ID;
 
 /* VideoProcAmp properties */
-#define CAM_PROPERTY_ID_VIDEO_PROC_AMP_BacklightCompensation 0x01
-#define CAM_PROPERTY_ID_VIDEO_PROC_AMP_Brightness 0x02
-#define CAM_PROPERTY_ID_VIDEO_PROC_AMP_Contrast 0x03
-#define CAM_PROPERTY_ID_VIDEO_PROC_AMP_Hue 0x04
-#define CAM_PROPERTY_ID_VIDEO_PROC_AMP_WhiteBalance 0x05
+typedef enum
+{
+	CAM_PROPERTY_ID_VIDEO_PROC_AMP_BacklightCompensation = 0x01,
+	CAM_PROPERTY_ID_VIDEO_PROC_AMP_Brightness = 0x02,
+	CAM_PROPERTY_ID_VIDEO_PROC_AMP_Contrast = 0x03,
+	CAM_PROPERTY_ID_VIDEO_PROC_AMP_Hue = 0x04,
+	CAM_PROPERTY_ID_VIDEO_PROC_AMP_WhiteBalance = 0x05
+} CAM_PROPERTY_ID_VIDEO;
 
 typedef enum
 {
-	CAM_PROPERTY_CAPABILITY_Manual = 0x01,
-	CAM_PROPERTY_CAPABILITY_Auto = 0x02,
+	CAM_PROPERTY_CAPABILITY_Manual = 0x01u,
+	CAM_PROPERTY_CAPABILITY_Auto = 0x02u
 } CAM_PROPERTY_CAPABILITIES;
 
 typedef struct
 {
 	CAM_PROPERTY_SET PropertySet;
 	BYTE PropertyId;
-	CAM_PROPERTY_CAPABILITIES Capabilities;
+	UINT32 Capabilities;
 	INT32 MinValue;
 	INT32 MaxValue;
 	INT32 Step;
@@ -333,4 +353,7 @@ typedef struct
 	CAM_PROPERTY_VALUE PropertyValue;
 } CAM_SET_PROPERTY_VALUE_REQUEST;
 
+#ifdef __cplusplus
+}
+#endif
 #endif /* FREERDP_CHANNEL_RDPECAM_H */
